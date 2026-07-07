@@ -17,6 +17,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_http::init())
         .setup(|app| {
             // Register state up front with port 0 (= "not ready yet") so the
             // window can open and render a splash instead of blocking the UI
@@ -34,8 +35,6 @@ pub fn run() {
                         let state = handle.state::<AppState>();
                         *state.sidecars.lock().unwrap() = Some(sc);
                         *state.django_port.lock().unwrap() = dj_port;
-                        // Visible in the `npm run tauri dev` terminal — this is
-                        // how we verify readiness before the frontend exists.
                         println!("Finora backend ready on 127.0.0.1:{dj_port}");
                     }
                     Err(e) => {
