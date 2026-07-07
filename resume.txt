@@ -1,0 +1,162 @@
+FINORA — DETAILED RESUME CONTEXT (Frontend phase — transport proven, auth next)
+
+PROJECT
+Finora, an offline-first desktop accounting/billing app. Tauri v2 (Rust shell)
+manages two child processes (sidecars): a Django/DRF backend (frozen to .exe via
+Nuitka) and a portable PostgreSQL 18.4 instance. Frontend is SvelteKit (SPA mode,
+adapter-static, ssr=false) + TypeScript + Svelte 5 (runes), talking to the local
+Django server over a random localhost port. One user, multiple companies. Full
+architecture and locked business decisions are in the two strategy files
+(backend-strategy.md, frontend-strategy.md).
+
+ENVIRONMENT SPECIFICS (unchanged, important)
+- Dev machine Windows, project root E:\PyCharm\Services\Finora\.
+- Python 3.14 (Nuitka 4.1.3 warns experimental; downgrade to 3.13 deferred to
+  final ship build, not now).
+- Windows user is "death"; app data dir resolves to
+  C:\Users\death\AppData\Roaming\com.byteforce.finora\.
+- App identifier: com.byteforce.finora. Tauri bundle/product name: Finora.
+
+=======================================================================
+STATUS SUMMARY
+- Backend logic: COMPLETE (build order steps 1-7), frozen to exe.
+- Packaging: COMPLETE and proven end-to-end (was the previous phase).
+- Tauri sidecar wiring: COMPLETE — Postgres + Django boot cleanly, window opens
+  immediately and stays responsive, backend prints readiness line.
+- Frontend transport (frontend build order step 1): PROVEN. A fetch from the
+  Svelte frontend reaches Django and reads the response back, CORS-free.
+- NEXT: frontend build order step 2 — auth + license/company setup + app store.
+=======================================================================
+
+WHAT WAS COMPLETED THIS SESSION (all applied and verified)
+
+1. run_server.py migrate-crash fix (packaging) — APPLIED.
+   - Added at top, before Django import/config: if sys.stdout is None ->
+     sys.stdout = open(os.devnull,"w"); same for sys.stderr. (Windowed Nuitka exe
+     has stdout/stderr == None, which crashed migrate with AttributeError.)
+   - migrate now called as: call_command("migrate", interactive=False,
+     verbosity=0, stdout=io.StringIO()); added "import io".
+   - Rebuilt via build_backend.bat; copied run output into
+     desktop/src-tauri/resources/backend/finora-backend.exe.
+
+2. lib.rs — startup moved OFF the main/UI thread + HTTP plugin registered.
+   - AppState registered up front with sidecars=None, django_port=0 so the window
+     opens instantly (no more "not responding" during the ~5-15s boot).
+   - backend::start() runs in std::thread::spawn; on success it stores the
+     Sidecars and sets django_port; prints "Finora backend ready on 127.0.0.1:<port>".
+     On failure prints "sidecar startup failed: <err>".
+   - Destroyed handler unchanged (lock().take() then stop()).
+   - Added .plugin(tauri_plugin_http::init()).
+   - Edge case NOT yet handled: closing the window during boot leaves sidecars=None,
+     so stop() won't fire and Postgres/Django could orphan. Harmless in dev; harden
+     later once the splash exists (ready-flag or join on shutdown).
+
+3. tauri.conf.json — window title renamed from "desktop" to "Finora".
+
+4. Cargo.toml — added tauri-plugin-http = "2". (Pulls reqwest transitively; that
+   is intended/fine. The old "no direct reqwest" note was only about not hand-rolling
+   a readiness check with it.)
+
+5. capabilities/default.json — added "http:default" AND a scoped extension:
+   { "identifier": "http:default", "allow": [
+       { "url": "http://127.0.0.1:*" }, { "url": "http://127.0.0.1:*/*" } ] }
+   Both patterns are required — the plugin's default permission enables fetch
+   operations but allows NO origins until scoped; missing this yields
+   "url not allowed on the configured scope". Wildcard port because Django's port
+   is random per launch.
+
+6. npm — installed @tauri-apps/plugin-http (in desktop/).
+
+7. src/lib/api.ts — NEW. Minimal API client (NO CSRF, NO login state yet):
+   - ApiError class (status, body).
+   - getDjangoPort() -> invoke<number>("get_django_port"); returns 0 while booting.
+   - apiBase() -> cached base URL or null.
+   - waitForBackend({intervalMs=400, timeoutMs=30000, onAttempt}) polls
+     getDjangoPort until non-zero, caches _base = http://127.0.0.1:<port>, returns it.
+   - request<T>(path, init) -> uses @tauri-apps/plugin-http fetch (Rust-side, CORS-free),
+     JSON parse, throws ApiError on non-ok. Does NOT set credentials — the plugin's
+     built-in cookie store (default "cookies" feature) will carry the session cookie
+     once auth is added.
+   - health() -> GET /health/.
+
+8. src/routes/+page.svelte — REPLACED demo greet with a splash + smoke test.
+   Three states: connecting (spinner + attempt counter) / ready (shows base URL +
+   /health/ result) / error (message + Retry button). Dark theme, throwaway styling
+   (will be replaced by real UI + design tokens later).
+
+VERIFIED RESULT (this session's exit state)
+- Window opens immediately on "Starting Finora…" splash, stays responsive.
+- Flips to green "Backend connected" showing base URL http://127.0.0.1:<random>
+  (observed 58793 this run) and "/health/ -> OK".
+- Terminal shows "Finora backend ready on 127.0.0.1:<port>".
+- Conclusion: full transport chain works — Tauri IPC (get_django_port) -> port
+  handshake -> plugin fetch -> Django -> response read. No CORS middleware needed.
+
+=======================================================================
+KEY DECISIONS THIS SESSION (so we don't relitigate)
+
+- Transport = Tauri HTTP plugin (@tauri-apps/plugin-http), NOT webview fetch +
+  django-cors-headers. Reason: webview loads from http://localhost:1420 (dev) /
+  http://tauri.localhost (release), Django is on http://127.0.0.1:<port> — cross
+  origin; plain webview fetch would fail CORS. Plugin fetch runs from Rust so CORS
+  doesn't apply, behaves the same dev vs release, and gives a controllable cookie
+  store for sessions. This avoids the cross-origin-credentialed-cookie-over-http mess.
+
+- Chose the LAYERED path: prove bare transport (port handshake + splash + one real
+  /health/ call) BEFORE adding auth, so auth debugging isn't tangled with transport
+  debugging. Transport is now proven, so auth is unblocked.
+
+- Auth strategy still OPEN. Backend currently uses DRF SessionAuthentication +
+  IsAuthenticated (CSRF on writes, login flow needed). The plugin has a cookie store,
+  but whether the session cookie PERSISTS across plugin-fetch requests is UNVERIFIED —
+  that is the first thing to test in step 2. If session cookies don't persist cleanly,
+  the fallback is to switch DRF to TokenAuthentication (Authorization: Token <key>
+  header, no CSRF) — cleaner for desktop. Decide by testing, don't pre-build.
+
+=======================================================================
+IMMEDIATE NEXT STEPS (frontend build order step 2 — auth + setup + store)
+
+1. Verify session-cookie persistence: log in via the plugin fetch (POST creds),
+   then hit an IsAuthenticated endpoint (e.g. GET /api/accounts/settings/) and
+   confirm it returns 200 (cookie was carried). If not -> switch backend to
+   TokenAuthentication and revisit.
+   NOTE: backend currently has NO login endpoint exposed under /api/accounts/ (only
+   companies + settings viewsets). Need to add a session-login view (CSRF token
+   endpoint + login/logout) OR add DRF token auth + an obtain-token view. This is a
+   backend gap to fill as part of step 2.
+
+2. Build the app store (Svelte): current user, current company, current FY,
+   mode(single|multi). Populate after login.
+
+3. Auth screen + license mode select (single/multi) on first login; then company
+   setup / default company + segregation preference (multi mode). Per
+   frontend-strategy.md screens list.
+
+4. Extend api.ts with auth-aware request handling (CSRF header if sessions, or
+   Authorization header if tokens) once #1 decides the mechanism.
+
+THEN continue frontend build order:
+  3 SmartLookup (party/item) + create pop-ups -> 4 Purchase -> 5 Payment/Received +
+  allocation display -> 6 Sale master + company picker + derived view -> 7 Stock +
+  convert -> 8 Reports + daily sheet -> 9 FY + settings.
+
+=======================================================================
+KNOWN BACKEND GAPS (vs backend-strategy.md — fill opportunistically)
+- No login/logout/CSRF-token endpoint exposed yet (needed for step 2).
+- SaleMaster EDIT not implemented (only create + cancel).
+- reports/services.py empty (report logic lives in reports/selectors.py).
+- pg_dump backup flow not wired.
+
+KNOWN CAVEATS / WATCH-FORS (carried forward)
+- Postgres readiness uses a fixed 2000ms sleep before CREATE DATABASE; may need a
+  pg_isready loop if it flakes on slower machines.
+- Dev vs release resource paths differ (handled via cfg(debug_assertions) in
+  resources_root); RELEASE path branch NOT yet validated with a full `tauri build`.
+- initdb/CREATE run only on first launch (guarded by pgdata.exists()); later
+  launches skip them (this session's run showed "database system was shut down",
+  confirming the skip path works).
+- backend/.env committed with dev SECRET_KEY + DB creds (finora/finora); local
+  embedded DB so low risk, but move out of VCS before ship.
+- Bundled Postgres ships ~600 timezone + many locale files; optional size trim later.
+- Python 3.14 + Nuitka 4.1.3 experimental; downgrade to 3.13 before shipping.
+- Window-close-during-boot orphan edge case (see lib.rs note above).
