@@ -1,210 +1,102 @@
-import { invoke } from "@tauri-apps/api/core";
-import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import {
+  login as apiLogin,
+  logout as apiLogout,
+  register as apiRegister,
+  setTokens,
+  clearTokens,
+  request,
+} from "$lib/api";
+import { load } from "@tauri-apps/plugin-store";
 
-/** Thrown for any non-2xx response, carrying the parsed body for inspection. */
-export class ApiError extends Error {
-  status: number;
-  body: unknown;
-  constructor(status: number, message: string, body: unknown) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-    this.body = body;
-  }
+type User = { user_id: number; username: string };
+type Mode = "single" | "multi";
+type Setting = {
+  active_mode: Mode;
+  default_company: number | null;
+  segregation_enabled: boolean;
+  is_mode_locked: boolean;
+};
+type Company = { id: number; name: string; is_default: boolean; created_at: string };
+
+const STORE = "session.json";
+const REFRESH_KEY = "refresh";
+
+let user = $state<User | null>(null);
+let setting = $state<Setting | null>(null);
+let companies = $state<Company[]>([]);
+let ready = $state(false);
+
+async function persistRefresh(token: string | null) {
+  const s = await load(STORE, { autoSave: true, defaults: {} });
+  if (token) await s.set(REFRESH_KEY, token);
+  else await s.delete(REFRESH_KEY);
 }
 
-// Resolved once the backend port is known; null until then.
-let _base: string | null = null;
-let _access: string | null = null;
-let _refresh: string | null = null;
-
-export function setTokens(t: { access: string; refresh?: string } | null) {
-  _access = t?.access ?? null;
-  if (t?.refresh) _refresh = t.refresh;
-}
-export function clearTokens() { _access = null; _refresh = null; }
-export function getAccess() { return _access; }
-export function getRefresh() { return _refresh; }
-
-/** Single call to the Rust side. Returns 0 while the backend is still booting. */
-export async function getDjangoPort(): Promise<number> {
-  return await invoke<number>("get_django_port");
+async function loadContext() {
+  setting = await request<Setting>("/api/accounts/settings/");
+  companies = await request<Company[]>("/api/accounts/companies/");
 }
 
-/** The resolved base URL (e.g. http://127.0.0.1:50146), or null if not ready. */
-export function apiBase(): string | null {
-  return _base;
-}
+export const auth = {
+  get user() { return user; },
+  get setting() { return setting; },
+  get companies() { return companies; },
+  get mode(): Mode | null { return setting?.active_mode ?? null; },
+  get ready() { return ready; },
+  get isAuthed() { return user !== null; },
+  get needsSetup() { return companies.length === 0; },
 
-interface WaitOpts {
-  intervalMs?: number;
-  timeoutMs?: number;
-  onAttempt?: (attempt: number) => void;
-}
-
-/**
- * Polls get_django_port until it returns a non-zero port, then caches and
- * returns the base URL. A non-zero port means Rust's readiness loop already
- * saw Django accepting TCP connections, i.e. migrations are done and Waitress
- * is serving — so the very next HTTP request should succeed.
- */
-export async function waitForBackend(opts: WaitOpts = {}): Promise<string> {
-  const intervalMs = opts.intervalMs ?? 400;
-  const timeoutMs = opts.timeoutMs ?? 30000;
-  const start = Date.now();
-  let attempt = 0;
-
-  for (;;) {
-    attempt += 1;
-    opts.onAttempt?.(attempt);
-
-    let port = 0;
-    try {
-      port = await getDjangoPort();
-    } catch {
-      // IPC hiccup or command not registered yet — treat as "not ready".
-      port = 0;
+  async restore() {
+    const s = await load(STORE, { autoSave: true, defaults: {} });
+    const refresh = await s.get<string>(REFRESH_KEY);
+    if (refresh) {
+      setTokens({ access: "", refresh });
+      try {
+        user = await request<User>("/api/accounts/auth/me/");
+        await loadContext();
+      } catch {
+        clearTokens();
+        await persistRefresh(null);
+        user = null;
+      }
     }
+    ready = true;
+  },
 
-    if (port > 0) {
-      _base = `http://127.0.0.1:${port}`;
-      return _base;
-    }
+  async register(username: string, password: string) {
+    const r = await apiRegister(username, password);
+    await persistRefresh(r.refresh);
+    user = await request<User>("/api/accounts/auth/me/");
+    await loadContext();
+  },
 
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(
-        `Backend did not become ready within ${Math.round(
-          timeoutMs / 1000
-        )}s (attempts=${attempt}).`
-      );
-    }
+  async login(username: string, password: string) {
+    const r = await apiLogin(username, password);
+    await persistRefresh(r.refresh);
+    user = await request<User>("/api/accounts/auth/me/");
+    await loadContext();
+  },
 
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-}
+  async logout() {
+    await apiLogout();
+    await persistRefresh(null);
+    user = null;
+    setting = null;
+    companies = [];
+  },
 
-/** Thin JSON request wrapper over the Tauri HTTP plugin's fetch. */
-async function rawRequest<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
-  if (!_base) {
-    throw new Error("API base not resolved — call waitForBackend() first.");
-  }
-
-  const res = await tauriFetch(_base + path, {
-    ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...(init.headers ?? {}),
-    },
-  });
-
-  const text = await res.text();
-  let data: unknown = text;
-  if (text) {
-    try { data = JSON.parse(text); } catch { /* keep raw text */ }
-  }
-
-  if (!res.ok) {
-    const detail =
-      data && typeof data === "object" && "detail" in data
-        ? String((data as Record<string, unknown>).detail)
-        : `${res.status} ${res.statusText}`;
-    throw new ApiError(res.status, detail, data);
-  }
-
-  return data as T;
-}
-
-async function refreshAccess(): Promise<boolean> {
-  if (!_refresh) return false;
-  try {
-    const r = await rawRequest<{ access: string; refresh?: string }>(
-      "/api/accounts/auth/refresh/",
-      { method: "POST", body: JSON.stringify({ refresh: _refresh }) }
-    );
-    setTokens(r);
-    return true;
-  } catch {
-    clearTokens();
-    return false;
-  }
-}
-
-/** Auth-aware JSON request: injects Bearer token, retries once on 401 via refresh. */
-export async function request<T = unknown>(
-  path: string,
-  init: RequestInit = {},
-  _retried = false
-): Promise<T> {
-  const headers: Record<string, string> = {
-    ...((init.headers as Record<string, string>) ?? {}),
-  };
-  if (_access) headers["Authorization"] = `Bearer ${_access}`;
-
-  try {
-    return await rawRequest<T>(path, { ...init, headers });
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401 && !_retried && (await refreshAccess())) {
-      return request<T>(path, init, true);
-    }
-    throw e;
-  }
-}
-
-/** Unauthenticated smoke-test endpoint (plain Django view, no auth/CSRF). */
-export async function health(): Promise<{ status: string }> {
-  return await request<{ status: string }>("/health/");
-}
-
-/** Public: whether the single local account has been created yet. */
-export async function authState(): Promise<{ initialized: boolean }> {
-  return await rawRequest<{ initialized: boolean }>("/api/accounts/auth/state/");
-}
-
-/** First-run only: create the local account, receive + store tokens. */
-export async function register(username: string, password: string) {
-  const r = await rawRequest<{ access: string; refresh: string }>(
-    "/api/accounts/auth/register/",
-    { method: "POST", body: JSON.stringify({ username, password }) }
-  );
-  setTokens(r);
-  return r;
-}
-
-export async function login(username: string, password: string) {
-  const r = await rawRequest<{ access: string; refresh: string }>(
-    "/api/accounts/auth/login/",
-    { method: "POST", body: JSON.stringify({ username, password }) }
-  );
-  setTokens(r);
-  return r;
-}
-
-export async function logout() {
-  if (_refresh) {
-    await request("/api/accounts/auth/logout/", {
+  async enableMulti(segregation: boolean) {
+    setting = await request<Setting>("/api/accounts/settings/switch_multi/", {
       method: "POST",
-      body: JSON.stringify({ refresh: _refresh }),
-    }).catch(() => {});
-  }
-  clearTokens();
-}
+      body: JSON.stringify({ segregation_enabled: segregation }),
+    });
+  },
 
-export type Suggestion = { id: number; name: string; [k: string]: unknown };
-
-export async function suggest(
-  type: "ITEM" | "PARTY",
-  q: string,
-  limit = 10,
-  signal?: AbortSignal
-): Promise<Suggestion[]> {
-  const p = new URLSearchParams({ type, q, limit: String(limit) });
-  return await request<Suggestion[]>(`/api/search/suggest/?${p.toString()}`, { signal });
-}
-
-export async function recordUsage(type: "ITEM" | "PARTY", id: number): Promise<void> {
-  await request("/api/search/record/", {
-    method: "POST",
-    body: JSON.stringify({ type, id }),
-  }).catch(() => {}); // ranking is best-effort; never block UX
-}
+  async createCompany(name: string, isDefault: boolean) {
+    await request("/api/accounts/companies/", {
+      method: "POST",
+      body: JSON.stringify({ name, is_default: isDefault }),
+    });
+    companies = await request<Company[]>("/api/accounts/companies/");
+  },
+};
