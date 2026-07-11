@@ -1,40 +1,72 @@
-import io
-import os
-import sys
-from pathlib import Path
+from django.db import transaction
 
-# The windowed Nuitka build (--windows-console-mode=disable) starts with no
-# console attached, so sys.stdout / sys.stderr are None. Anything that writes
-# to them — Django's migrate output, warnings, tracebacks — raises
-# AttributeError: 'NoneType' object has no attribute 'write'. Redirect both to
-# os.devnull before Django is imported or configured.
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
-
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.production")
+from ..common.exceptions import LicenseError, DomainError
+from .models import Company, UserCompanySetting, License, User
 
 
-def main():
-    rc = os.environ.get("FINORA_RUNTIME_CONFIG", "")
-    if not rc or not Path(rc).is_file():
-        raise SystemExit(
-            "FINORA_RUNTIME_CONFIG missing — Tauri must write runtime config before starting backend."
-        )
-
-    from django.core.management import call_command
-    import django
-
-    django.setup()
-    call_command("migrate", interactive=False, verbosity=0, stdout=io.StringIO())
-
-    from waitress import serve
-    from config.wsgi import application
-
-    port = int(os.environ.get("DJANGO_PORT", "8799"))
-    serve(application, host="127.0.0.1", port=port, threads=8)
+class AlreadyInitialized(Exception):
+    """Raised when registration is attempted but a local account already exists."""
+    pass
 
 
-if __name__ == "__main__":
-    main()
+@transaction.atomic
+def register_first_user(username, password):
+    """First-run only: create the single local user + base license + setting.
+
+    Guards on User.objects.exists() inside the transaction so a second call can
+    never create a competing account. Password is hashed by create_user.
+    """
+    if User.objects.exists():
+        raise AlreadyInitialized()
+    user = User.objects.create_user(username=username, password=password)
+    License.objects.create(
+        user=user, plan="base", mode=License.SINGLE, is_active=True
+    )
+    UserCompanySetting.objects.create(
+        user=user,
+        active_mode=UserCompanySetting.SINGLE,
+        segregation_enabled=False,
+        is_mode_locked=True,
+    )
+    return user
+
+
+@transaction.atomic
+def create_company(user, name, make_default=False):
+    setting = UserCompanySetting.objects.select_for_update().filter(user=user).first()
+    if (
+        setting
+        and setting.active_mode == UserCompanySetting.SINGLE
+        and user.companies.exists()
+    ):
+        raise LicenseError("Single-company mode allows only one company.")
+    if make_default:
+        Company.objects.filter(user=user, is_default=True).update(is_default=False)
+    company = Company.objects.create(user=user, name=name, is_default=make_default)
+    if setting and setting.default_company_id is None:
+        setting.default_company = company
+        setting.save(update_fields=["default_company"])
+    return company
+
+
+@transaction.atomic
+def switch_to_multi(user, segregation_enabled=False):
+    lic = License.objects.select_for_update().filter(user=user).first()
+    if not lic or not lic.allows_multi:
+        raise LicenseError("Multi-company mode is not unlocked for this license.")
+    setting, _ = UserCompanySetting.objects.select_for_update().get_or_create(user=user)
+    setting.active_mode = UserCompanySetting.MULTI
+    setting.segregation_enabled = segregation_enabled
+    setting.is_mode_locked = True
+    setting.save()
+    return setting
+
+
+@transaction.atomic
+def set_segregation(user, enabled):
+    setting = UserCompanySetting.objects.select_for_update().get(user=user)
+    if setting.active_mode != UserCompanySetting.MULTI:
+        raise DomainError("Segregation applies only in multi-company mode.")
+    setting.segregation_enabled = enabled
+    setting.save(update_fields=["segregation_enabled"])
+    return setting
