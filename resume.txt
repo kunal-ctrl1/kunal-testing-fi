@@ -1,162 +1,128 @@
-FINORA — DETAILED RESUME CONTEXT (Frontend phase — transport proven, auth next)
+Before the handoff, one honest note: the fact that it landed on `/fy` again means boot decided `needsFy` is true, which means `loadContext()` fetched `GET /api/fy/` and found no active, open financial year — even though the earlier "already exists" proves one was created. That read/write mismatch is the crux the next session has to resolve empirically (it can't be reasoned out from here without seeing the actual table + the actual API response). The resume below front-loads exactly how to do that.
 
-PROJECT
-Finora, an offline-first desktop accounting/billing app. Tauri v2 (Rust shell)
-manages two child processes (sidecars): a Django/DRF backend (frozen to .exe via
-Nuitka) and a portable PostgreSQL 18.4 instance. Frontend is SvelteKit (SPA mode,
-adapter-static, ssr=false) + TypeScript + Svelte 5 (runes), talking to the local
-Django server over a random localhost port. One user, multiple companies. Full
-architecture and locked business decisions are in the two strategy files
-(backend-strategy.md, frontend-strategy.md).
+Here's a complete handoff you can save to `read_here_to_resume.txt` (or `artifacts/resume-summary.md`) and open a fresh Opus 4.8 session with.
 
-ENVIRONMENT SPECIFICS (unchanged, important)
-- Dev machine Windows, project root E:\PyCharm\Services\Finora\.
-- Python 3.14 (Nuitka 4.1.3 warns experimental; downgrade to 3.13 deferred to
-  final ship build, not now).
-- Windows user is "death"; app data dir resolves to
-  C:\Users\death\AppData\Roaming\com.byteforce.finora\.
-- App identifier: com.byteforce.finora. Tauri bundle/product name: Finora.
+---
 
-=======================================================================
-STATUS SUMMARY
-- Backend logic: COMPLETE (build order steps 1-7), frozen to exe.
-- Packaging: COMPLETE and proven end-to-end (was the previous phase).
-- Tauri sidecar wiring: COMPLETE — Postgres + Django boot cleanly, window opens
-  immediately and stays responsive, backend prints readiness line.
-- Frontend transport (frontend build order step 1): PROVEN. A fetch from the
-  Svelte frontend reaches Django and reads the response back, CORS-free.
-- NEXT: frontend build order step 2 — auth + license/company setup + app store.
-=======================================================================
+# Finora — Session Resume (Frontend: FY gate + app shell)
 
-WHAT WAS COMPLETED THIS SESSION (all applied and verified)
+## 1. Project snapshot
 
-1. run_server.py migrate-crash fix (packaging) — APPLIED.
-   - Added at top, before Django import/config: if sys.stdout is None ->
-     sys.stdout = open(os.devnull,"w"); same for sys.stderr. (Windowed Nuitka exe
-     has stdout/stderr == None, which crashed migrate with AttributeError.)
-   - migrate now called as: call_command("migrate", interactive=False,
-     verbosity=0, stdout=io.StringIO()); added "import io".
-   - Rebuilt via build_backend.bat; copied run output into
-     desktop/src-tauri/resources/backend/finora-backend.exe.
+**Finora** is an offline-first desktop accounting/billing app for small businesses. Repo: `github.com/pratik-mukherjee-dev/Finora.git`.
 
-2. lib.rs — startup moved OFF the main/UI thread + HTTP plugin registered.
-   - AppState registered up front with sidecars=None, django_port=0 so the window
-     opens instantly (no more "not responding" during the ~5-15s boot).
-   - backend::start() runs in std::thread::spawn; on success it stores the
-     Sidecars and sets django_port; prints "Finora backend ready on 127.0.0.1:<port>".
-     On failure prints "sidecar startup failed: <err>".
-   - Destroyed handler unchanged (lock().take() then stop()).
-   - Added .plugin(tauri_plugin_http::init()).
-   - Edge case NOT yet handled: closing the window during boot leaves sidecars=None,
-     so stop() won't fire and Postgres/Django could orphan. Harmless in dev; harden
-     later once the splash exists (ready-flag or join on shutdown).
+- **Shell:** Tauri v2 (Rust), app id `com.byteforce.finora`. Sidecar-manages a portable PostgreSQL 18.4 and a Django backend frozen to a Windows exe via Nuitka.
+- **Backend:** Django + DRF, nine apps under `backend/apps/` (`common, accounts, financialyear, catalogue, parties, stock, vouchers, search, reports`). Auth is **JWT** (`rest_framework_simplejwt`), access-token lifetime 12h.
+- **Frontend:** SvelteKit SPA (`adapter-static`, SSR off, Svelte 5 runes) in `desktop/src/`. Transport is the **Tauri HTTP plugin** (Rust-side fetch) to avoid CORS, not webview fetch. API client at `desktop/src/lib/api.ts`.
+- **Dev workflow:** `npm run tauri dev` from `desktop\`. Windows, PyCharm, project root `E:\PyCharm\Services\Finora\`, user profile `death`.
+- **Working style:** deliver full file contents inline (not diffs), one layered build-order step at a time.
 
-3. tauri.conf.json — window title renamed from "desktop" to "Finora".
+## 2. What is already built and verified
 
-4. Cargo.toml — added tauri-plugin-http = "2". (Pulls reqwest transitively; that
-   is intended/fine. The old "no direct reqwest" note was only about not hand-rolling
-   a readiness check with it.)
+- Tauri shell + Postgres/Django sidecar wiring + `api.ts` (JWT access/refresh, port discovery via `get_django_port`, `waitForBackend`).
+- Auth flow: register (first-run only) → login → logout, tokens persisted in Tauri `plugin-store` (`session.json`, key `refresh`).
+- Company setup flow: mode select (single/multi) → create company.
+- **SmartLookup + PartyCreateDialog + ItemCreateDialog** components exist and are complete (`desktop/src/lib/components/`), but are **not yet consumed by any screen**. They call `/api/search/suggest/`, `/api/search/record/`, `/api/parties/`, `/api/catalogue/items/`, `/api/catalogue/mappings/`.
 
-5. capabilities/default.json — added "http:default" AND a scoped extension:
-   { "identifier": "http:default", "allow": [
-       { "url": "http://127.0.0.1:*" }, { "url": "http://127.0.0.1:*/*" } ] }
-   Both patterns are required — the plugin's default permission enables fetch
-   operations but allows NO origins until scoped; missing this yields
-   "url not allowed on the configured scope". Wildcard port because Django's port
-   is random per launch.
+## 3. What this session added (the FY gate + real app shell)
 
-6. npm — installed @tauri-apps/plugin-http (in desktop/).
+Goal was the next build-order step. Discovered a hard prerequisite: **every voucher/stock endpoint requires an active financial year** (`vouchers/views.py::_context` → `financialyear.selectors.active_fy`, raising `FinancialYearLocked` if none), but nothing in register→login→mode→company ever creates an FY, and the store didn't track one. So the step became: FY bootstrap + a real app shell, which unblocks the Purchase screen.
 
-7. src/lib/api.ts — NEW. Minimal API client (NO CSRF, NO login state yet):
-   - ApiError class (status, body).
-   - getDjangoPort() -> invoke<number>("get_django_port"); returns 0 while booting.
-   - apiBase() -> cached base URL or null.
-   - waitForBackend({intervalMs=400, timeoutMs=30000, onAttempt}) polls
-     getDjangoPort until non-zero, caches _base = http://127.0.0.1:<port>, returns it.
-   - request<T>(path, init) -> uses @tauri-apps/plugin-http fetch (Rust-side, CORS-free),
-     JSON parse, throws ApiError on non-ok. Does NOT set credentials — the plugin's
-     built-in cookie store (default "cookies" feature) will carry the session cookie
-     once auth is added.
-   - health() -> GET /health/.
+Files changed this session:
 
-8. src/routes/+page.svelte — REPLACED demo greet with a splash + smoke test.
-   Three states: connecting (spinner + attempt counter) / ready (shows base URL +
-   /health/ result) / error (message + Retry button). Dark theme, throwaway styling
-   (will be replaced by real UI + design tokens later).
+- `desktop/src/lib/stores/auth.svelte.ts` — extended the app store: loads/tracks the active FY and a persisted current-company selection; added getters `fy`, `currentCompany`, `needsFy`; actions `ensureFy`, `setCurrentCompany`.
+- `desktop/src/routes/fy/+page.svelte` — **new** FY-setup gate screen (prefills Indian FY Apr 1–Mar 31, editable).
+- `desktop/src/routes/app/+page.svelte` — replaced the placeholder with a real shell (nav rail, company switcher in multi mode, FY badge, Home summary, section placeholders).
+- `desktop/src/routes/+page.svelte` — boot cascade now includes the FY gate.
+- `desktop/src/routes/setup/+page.svelte` — after creating the first company, routes to `/fy`.
 
-VERIFIED RESULT (this session's exit state)
-- Window opens immediately on "Starting Finora…" splash, stays responsive.
-- Flips to green "Backend connected" showing base URL http://127.0.0.1:<random>
-  (observed 58793 this run) and "/health/ -> OK".
-- Terminal shows "Finora backend ready on 127.0.0.1:<port>".
-- Conclusion: full transport chain works — Tauri IPC (get_django_port) -> port
-  handshake -> plugin fetch -> Django -> response read. No CORS middleware needed.
+**Boot routing cascade** (`routes/+page.svelte`, after backend ready + `authState`):
+```ts
+await auth.restore();
+if (!auth.isAuthed) { await goto("/login"); return; }
+if (auth.needsSetup) { await goto("/setup"); return; }
+if (auth.needsFy)   { await goto("/fy");    return; }
+await goto("/app");
+```
 
-=======================================================================
-KEY DECISIONS THIS SESSION (so we don't relitigate)
+**Store context loader** (the code central to the current bug):
+```ts
+async function loadContext() {
+  setting = await request<Setting>("/api/accounts/settings/");
+  companies = await request<Company[]>("/api/accounts/companies/");
+  const years = await request<FinancialYear[]>("/api/fy/");
+  fy = years.find((y) => y.is_active && !y.is_closed) ?? null;
+  await resolveCurrentCompany();
+}
+```
+`needsFy` getter: `user !== null && companies.length > 0 && fy === null`.
 
-- Transport = Tauri HTTP plugin (@tauri-apps/plugin-http), NOT webview fetch +
-  django-cors-headers. Reason: webview loads from http://localhost:1420 (dev) /
-  http://tauri.localhost (release), Django is on http://127.0.0.1:<port> — cross
-  origin; plain webview fetch would fail CORS. Plugin fetch runs from Rust so CORS
-  doesn't apply, behaves the same dev vs release, and gives a controllable cookie
-  store for sessions. This avoids the cross-origin-credentialed-cookie-over-http mess.
+**Idempotent FY create** (added to fix an earlier double-submit; adopts an existing FY on conflict):
+```ts
+async ensureFy(startDate, endDate) {
+  try {
+    fy = await request<FinancialYear>("/api/fy/", {
+      method: "POST",
+      body: JSON.stringify({ start_date: startDate, end_date: endDate }),
+    });
+  } catch (e) {
+    const years = await request<FinancialYear[]>("/api/fy/");
+    fy = years.find((y) => y.is_active && !y.is_closed) ?? null;
+    if (!fy) throw e;
+  }
+  return fy;
+}
+```
 
-- Chose the LAYERED path: prove bare transport (port handshake + splash + one real
-  /health/ call) BEFORE adding auth, so auth debugging isn't tangled with transport
-  debugging. Transport is now proven, so auth is unblocked.
+## 4. THE CURRENT BUG — and how to resolve it
 
-- Auth strategy still OPEN. Backend currently uses DRF SessionAuthentication +
-  IsAuthenticated (CSRF on writes, login flow needed). The plugin has a cookie store,
-  but whether the session cookie PERSISTS across plugin-fetch requests is UNVERIFIED —
-  that is the first thing to test in step 2. If session cookies don't persist cleanly,
-  the fallback is to switch DRF to TokenAuthentication (Authorization: Token <key>
-  header, no CSRF) — cleaner for desktop. Decide by testing, don't pre-build.
+**Symptom:** After restart, boot routes to `/fy` ("Set up your financial year"). That means `needsFy === true`, i.e. `loadContext()` fetched `GET /api/fy/` and `find(is_active && !is_closed)` returned nothing — so `fy` stayed `null`.
 
-=======================================================================
-IMMEDIATE NEXT STEPS (frontend build order step 2 — auth + setup + store)
+**The contradiction:** In an earlier attempt, the backend returned **"An active financial year already exists"** (HTTP 400 from `DomainError`). That message is only raised by `open_first_fy` when `active_fy(user)` returns a row — i.e. the **write path** saw an active, open FY. Yet the **read path** (`GET /api/fy/` list) is returning none. Company/account data persists across restarts (login works, companies exist), so the DB is not being reset.
 
-1. Verify session-cookie persistence: log in via the plugin fetch (POST creds),
-   then hit an IsAuthenticated endpoint (e.g. GET /api/accounts/settings/) and
-   confirm it returns 200 (cookie was carried). If not -> switch backend to
-   TokenAuthentication and revisit.
-   NOTE: backend currently has NO login endpoint exposed under /api/accounts/ (only
-   companies + settings viewsets). Need to add a session-login view (CSRF token
-   endpoint + login/logout) OR add DRF token auth + an obtain-token view. This is a
-   backend gap to fill as part of step 2.
+**This must be resolved by inspecting actual state, in this order:**
 
-2. Build the app store (Svelte): current user, current company, current FY,
-   mode(single|multi). Populate after login.
+1. **Webview devtools → Network.** Right-click in the Tauri window → Inspect. Reload. Find the boot `GET /api/fy/` request and read its JSON response body. Also check the Console for errors.
+   - If the response **contains the FY** but `fy` is still null → frontend parsing bug. Log `years` in `loadContext` and check the field names/types (`is_active`/`is_closed` should be JSON booleans). Fix the `find` predicate accordingly.
+   - If the response is **`[]`** → the read path returns nothing for this user → go to step 2.
 
-3. Auth screen + license mode select (single/multi) on first login; then company
-   setup / default company + segregation preference (multi mode). Per
-   frontend-strategy.md screens list.
+2. **Ground-truth the table.** From the backend source run `python manage.py shell` (point it at the live portable Postgres — the port is printed at launch as `Finora backend ready on 127.0.0.1:<port>`, DB creds in `backend/.env`), then:
+   ```python
+   from apps.financialyear.models import FinancialYear
+   from apps.accounts.models import User
+   list(FinancialYear.objects.values("id","user_id","start_date","end_date","is_active","is_closed"))
+   list(User.objects.values("id","username"))
+   ```
+   - If **no FY row exists** → the earlier 201 never persisted → backend/DB write issue (investigate `open_first_fy`, the Nuitka-frozen exe's DB connection/transaction commit, and whether anything runs `flush`/reinit on startup). Note: company writes DO persist, so compare the two code paths.
+   - If an FY row exists but **`user_id` differs** from the restored user's id → auth/ownership mismatch (a second user was created at some point). Reconcile accounts.
+   - If an FY row exists, is `is_active=true`, `is_closed=false`, and owned by the right user, yet `GET /api/fy/` returns `[]` → **read/write inconsistency** in the FY viewset/queryset; inspect `FinancialYearViewSet.get_queryset` and the request user resolution.
 
-4. Extend api.ts with auth-aware request handling (CSRF header if sessions, or
-   Authorization header if tokens) once #1 decides the mechanism.
+**Fastest unblock while investigating:** manually create/activate an FY (Django admin — `financialyear/admin.py` exists — or the shell). Once one active, open FY exists and is visible to `GET /api/fy/`, boot will skip `/fy` and land on the app shell, letting you proceed. Also confirm the `ensureFy` fix is actually compiled in (a stale Vite build is a cheap thing to rule out): with it applied, hitting "Start bookkeeping" once should adopt any existing FY and navigate rather than dead-ending.
 
-THEN continue frontend build order:
-  3 SmartLookup (party/item) + create pop-ups -> 4 Purchase -> 5 Payment/Received +
-  allocation display -> 6 Sale master + company picker + derived view -> 7 Stock +
-  convert -> 8 Reports + daily sheet -> 9 FY + settings.
+**Backend contract (verified) — `POST /api/fy/`** body `{ "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }`; `open_first_fy` raises `DomainError` (→ 400) if an active FY already exists. `GET /api/fy/` returns a **bare array** (DRF pagination is commented out in `config/settings/base.py`). Serializer fields: `id, start_date, end_date, is_active, is_closed, is_writable`.
 
-=======================================================================
-KNOWN BACKEND GAPS (vs backend-strategy.md — fill opportunistically)
-- No login/logout/CSRF-token endpoint exposed yet (needed for step 2).
-- SaleMaster EDIT not implemented (only create + cancel).
-- reports/services.py empty (report logic lives in reports/selectors.py).
-- pg_dump backup flow not wired.
+## 5. Exact next step (after the FY bug is resolved)
 
-KNOWN CAVEATS / WATCH-FORS (carried forward)
-- Postgres readiness uses a fixed 2000ms sleep before CREATE DATABASE; may need a
-  pg_isready loop if it flakes on slower machines.
-- Dev vs release resource paths differ (handled via cfg(debug_assertions) in
-  resources_root); RELEASE path branch NOT yet validated with a full `tauri build`.
-- initdb/CREATE run only on first launch (guarded by pgdata.exists()); later
-  launches skip them (this session's run showed "database system was shut down",
-  confirming the skip path works).
-- backend/.env committed with dev SECRET_KEY + DB creds (finora/finora); local
-  embedded DB so low risk, but move out of VCS before ship.
-- Bundled Postgres ships ~600 timezone + many locale files; optional size trim later.
-- Python 3.14 + Nuitka 4.1.3 experimental; downgrade to 3.13 before shipping.
-- Window-close-during-boot orphan edge case (see lib.rs note above).
+**Build the Purchase screen** — build-order step 4, the first voucher screen and first consumer of the existing SmartLookup + dialogs. Integration facts already confirmed from the backend:
+
+- Endpoint: `POST /api/vouchers/purchases/` with body:
+  ```json
+  { "company": <id>, "party": <id>, "date": "YYYY-MM-DD",
+    "number": null,
+    "lines": [ { "mapping": <mappingId>, "qty": <n>, "rate": <n> } ] }
+  ```
+- **Critical:** purchase lines take a `mapping` id (`ItemCompanyMapping`), **not** an item id. The item `suggest` endpoint returns only `{ id, name, base_unit }`. So after the user picks an item via SmartLookup, resolve it to a per-company mapping via `GET /api/catalogue/mappings/?item=<itemId>&company=<currentCompanyId>` (returns `{ id, item, rate, stock, ... }`) to obtain the `mapping` id and default `rate`. If no mapping exists for the current company, open `ItemCreateDialog` (it creates the item + mapping for the current company).
+- Use `auth.currentCompany.id` for `company` and rely on the server's active FY for `fy` (resolved server-side in `_context`). `number` can be null (server auto-numbers via `VoucherNumberSeq`, high-water template).
+- Response (`PurchaseSerializer`): `{ id, company, party, number, date, total_amount, is_cancelled, lines: [{ id, item, item_name, mapping, qty, rate, amount }] }`. Show the server-computed `number` and `total_amount` after save.
+- Party is picked via SmartLookup(type="PARTY") → `PartyCreateDialog` on no-match; posts to `POST /api/parties/`.
+- Slot the screen into the `app/+page.svelte` "purchase" section (currently a placeholder), or a `routes/app/purchase` route — match whatever nav pattern is chosen. `PurchaseViewSet` also has `cancel` (soft-cancel + reversing entries) for later.
+
+## 6. Known caveats / hardening (non-blocking)
+
+- `SECRET_KEY` defaults to the 22-char `"dev-insecure-change-me"`, which is what triggers the `InsecureKeyLengthWarning` (JWTs are signed with it). Set a 32+ byte `SECRET_KEY` in `backend/.env` before shipping.
+- `WARNING: Unauthorized: /api/accounts/auth/me/` on every boot is **expected/harmless** — `restore()` probes `/me/` with an empty access token, catches the 401, refreshes, and retries.
+- `loadContext` assumes DRF returns bare arrays (true today, pagination is off). If pagination is ever enabled, `companies`/`years` become `{results: []}` and `.length`/`.find` break — guard for it then.
+- Route guards assume boot always runs at `/` first (Tauri loads the dev root), so hard-refreshing directly on `/app` without going through boot isn't handled. Fine for normal flow.
+
+---
+
+That should let a fresh session pick up cold. Want me to keep going on the FY read/write investigation right now instead, or hold here?
