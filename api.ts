@@ -1,18 +1,19 @@
-/**
-   * Open the initial (active) financial year. Idempotent: if the server reports
-   * one already exists (a duplicate submit, or a prior run created it), adopt the
-   * existing active FY instead of failing. Only rethrows on a genuine failure.
-   */
-  async ensureFy(startDate: string, endDate: string) {
-    try {
-      fy = await request<FinancialYear>("/api/fy/", {
-        method: "POST",
-        body: JSON.stringify({ start_date: startDate, end_date: endDate }),
-      });
-    } catch (e) {
-      const years = await request<FinancialYear[]>("/api/fy/");
-      fy = years.find((y) => y.is_active && !y.is_closed) ?? null;
-      if (!fy) throw e;
+async function submit(e: Event) {
+    e.preventDefault();
+    if (busy) return;
+    if (!startDate || !endDate) return;
+    if (new Date(endDate) <= new Date(startDate)) {
+      error = "End date must be after the start date.";
+      return;
     }
-    return fy;
-  },
+    busy = true;
+    error = null;
+    try {
+      await auth.ensureFy(startDate, endDate);
+      await goto("/app");
+    } catch (err) {
+      error =
+        err instanceof ApiError ? err.message : "Could not create the financial year.";
+      busy = false; // on success we navigate away, so only reset on failure
+    }
+  }
