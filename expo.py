@@ -1,62 +1,85 @@
-from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
+from django.db import transaction
+from django.db.models import Sum
+from decimal import Decimal
 
-from .models import User
-from . import services
-
-
-class AuthStateView(APIView):
-    """Public: tells the frontend whether the single local account exists yet."""
-    permission_classes = (AllowAny,)
-
-    def get(self, request):
-        return Response({"initialized": User.objects.exists()})
+from apps.common.exceptions import DomainError
+from ..models import Allocation, SaleMaster, Purchase
+from ..selectors import open_sales, open_purchases
 
 
-class RegisterView(APIView):
-    """Public, first-run only: create the local account and return JWT tokens."""
-    permission_classes = (AllowAny,)
+@transaction.atomic
+def apply_receipt(received):
+    _allocate(received.party, received.amount, "RECEIVED", received.id,
+              "SALE", open_sales)
 
-    def post(self, request):
-        username = (request.data.get("username") or "").strip()
-        password = request.data.get("password") or ""
-        if not username or not password:
-            return Response(
-                {"detail": "Username and password are required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        try:
-            user = services.register_first_user(username, password)
-        except services.AlreadyInitialized:
-            return Response(
-                {"detail": "An account already exists on this device."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        refresh = RefreshToken.for_user(user)
-        return Response(
-            {"access": str(refresh.access_token), "refresh": str(refresh)},
-            status=status.HTTP_201_CREATED,
+
+@transaction.atomic
+def apply_payment(payment):
+    _allocate(payment.party, payment.amount, "PAYMENT", payment.id,
+              "PURCHASE", open_purchases)
+
+
+@transaction.atomic
+def apply_receipt_to_bill(received, bill_id):
+    """Settle ONLY the given sale (used by inline sale settlement)."""
+    _allocate_to_bill(received.party, received.amount, "RECEIVED", received.id,
+                      "SALE", SaleMaster, bill_id)
+
+
+@transaction.atomic
+def apply_payment_to_bill(payment, bill_id):
+    """Settle ONLY the given purchase (used by inline purchase settlement)."""
+    _allocate_to_bill(payment.party, payment.amount, "PAYMENT", payment.id,
+                      "PURCHASE", Purchase, bill_id)
+
+
+def _allocate(party, amount, settlement_type, settlement_id, bill_type, open_fn):
+    remaining = Decimal(str(amount))
+    for bill, pending in open_fn(party):
+        if remaining <= 0:
+            break
+        take = min(remaining, pending)
+        Allocation.objects.create(
+            settlement_type=settlement_type, settlement_id=settlement_id,
+            bill_type=bill_type, bill_id=bill.id, amount=take,
+        )
+        remaining -= take
+
+
+def _bill_pending(bill_type, bill_id, bill_total):
+    agg = Allocation.objects.filter(
+        bill_type=bill_type, bill_id=bill_id, is_reversal=False
+    ).aggregate(s=Sum("amount"))
+    return bill_total - (agg["s"] or Decimal("0.00"))
+
+
+def _allocate_to_bill(party, amount, settlement_type, settlement_id,
+                      bill_type, bill_model, bill_id):
+    """Allocate against ONE specific bill only. Any excess over that bill's
+    pending stays unallocated (on account) rather than spilling onto other
+    open bills — that spill-over is what the Settle page is for."""
+    bill = bill_model.objects.filter(
+        pk=bill_id, party=party, is_cancelled=False
+    ).first()
+    if bill is None:
+        raise DomainError("Target bill not found for this party.")
+    pending = _bill_pending(bill_type, bill.id, bill.total_amount)
+    take = min(Decimal(str(amount)), pending)
+    if take > 0:
+        Allocation.objects.create(
+            settlement_type=settlement_type, settlement_id=settlement_id,
+            bill_type=bill_type, bill_id=bill.id, amount=take,
         )
 
 
-class LogoutView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def post(self, request):
-        # Stateless logout: this single-user offline app keeps no server-side
-        # token blacklist. The client discards its stored tokens, which fully
-        # ends the session.
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class MeView(APIView):
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request):
-        return Response({
-            "user_id": request.user.id,
-            "username": request.user.username,
-        })
+@transaction.atomic
+def reverse_allocations(settlement_type, settlement_id):
+    allocs = Allocation.objects.filter(
+        settlement_type=settlement_type, settlement_id=settlement_id, is_reversal=False
+    )
+    for a in allocs:
+        Allocation.objects.create(
+            settlement_type=settlement_type, settlement_id=settlement_id,
+            bill_type=a.bill_type, bill_id=a.bill_id,
+            amount=-a.amount, is_reversal=True,
+        )
