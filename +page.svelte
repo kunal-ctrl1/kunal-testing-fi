@@ -23,37 +23,35 @@
     });
 
     type Mapping = { id: number; item: number; item_name: string; company: number; rate: number; stock: number; };
-    // A charge ledger straight from /api/ledgers/. `name` and `kind` drive the UI.
     type Ledger = {
         id: number; company: number | null; name: string;
         kind: "DISCOUNT" | "ROUND_OFF" | "TAX" | "OTHER"; is_system: boolean; gst_rate: number | null;
     };
-    // Read-back charge row from a saved voucher.
     type SavedCharge = {
         id: number; ledger: number; ledger_name: string; charge_type: string;
         mode: string; input_value: number; amount: number; sort_order: number;
     };
-    // A charge row being edited in the form. Its label/kind come from the picked ledger.
     type ChargeRow = {
         key: number; ledgerId: number | null; mode: "PERCENT" | "AMOUNT"; value: string;
     };
     type Line = {
-        key: number; item: Suggestion | null; company: number | null;
-        qty: string; rate: string; amount: string; resolving: boolean; note: string;
+        key: number; item: Suggestion | null; mapping: number | null;
+        qty: string; rate: string; amount: string;
+        resolving: boolean; note: string; noMapping: boolean; creatingMapping: boolean;
     };
-    type SaleLine = {
-        id: number; item: number; item_name: string; mapping: number;
-        company_resolved: number; company_name: string; derived: number | null;
-        qty: number; rate: number; amount: number;
+    type PurchaseLine = {
+        id: number;
+        item: number;
+        item_name: string;
+        mapping: number;
+        qty: number;
+        rate: number;
+        amount: number;
     };
-    type Derived = {
-        id: number; company: number; number: string; date: string;
-        total_amount: number; master: number; is_cancelled: boolean; lines: SaleLine[];
-    };
-    type Sale = {
+    type Purchase = {
         id: number; company: number; party: number; party_name: string;
-        number: string; date: string; segregate: boolean; total_amount: number;
-        is_cancelled: boolean; lines: SaleLine[]; derived: Derived[]; charges: SavedCharge[];
+        number: string; date: string; total_amount: number; is_cancelled: boolean;
+        lines: PurchaseLine[]; charges: SavedCharge[];
     };
     // User-level settlement mode (Cash/UPI/…) for the optional inline settlement.
     type SettlementMode = { id: number; name: string; is_system: boolean; is_active: boolean; sort_order: number; };
@@ -61,7 +59,8 @@
     let seq = 0;
     let chargeSeq = 0;
     const newLine = (): Line => ({
-        key: ++seq, item: null, company: null, qty: "1", rate: "0", amount: "0.00", resolving: false, note: "",
+        key: ++seq, item: null, mapping: null, qty: "1", rate: "0",
+        amount: "0.00", resolving: false, note: "", noMapping: false, creatingMapping: false,
     });
     const newCharge = (ledgerId: number | null = null): ChargeRow => ({
         key: ++chargeSeq, ledgerId, mode: "PERCENT", value: "0",
@@ -70,18 +69,17 @@
     const today = new Date().toISOString().slice(0, 10);
     let party = $state<Suggestion | null>(null);
     let date = $state(today);
-    let segregate = $state(false);
     let lines = $state<Line[]>([newLine()]);
     let saving = $state(false);
     let error = $state<string | null>(null);
-    let saved = $state<Sale | null>(null);
-    let history = $state<Sale[]>([]);
+    let saved = $state<{ number: string; total_amount: number } | null>(null);
+    let history = $state<Purchase[]>([]);
     let loadingHistory = $state(false);
     let editingId = $state<number | null>(null);
     let partyDialog = $state<string | null>(null);
     let itemDialog = $state<{ text: string; lineKey: number } | null>(null);
 
-    // ── optional inline settlement (creates a RECEIVED against THIS sale) ──────
+    // ── optional inline settlement (creates a PAYMENT against THIS purchase) ───
     let modes = $state<SettlementMode[]>([]);
     let settleAmount = $state("0");
     let settleModeId = $state<number | null>(null);
@@ -97,12 +95,10 @@
     let partyLookup = $state<{ focus: () => void } | null>(null);
 
     const companyId = $derived(auth.currentCompany?.id ?? null);
-    const isMulti = $derived(auth.mode === "multi");
     const total = $derived(lines.reduce((s, l) => s + (Number(l.amount) || 0), 0));
-    const canSave = $derived(!!party && !!companyId && lines.some((l) => l.item && Number(l.qty) > 0) && !saving);
+    const canSave = $derived(!!party && !!companyId && lines.some((l) => l.mapping && Number(l.qty) > 0) && !saving);
     const round2 = (n: number) => (Math.round(n * 100) / 100).toFixed(2);
 
-    // Charge ledgers we render in v1: discount + round-off only (TAX/OTHER = v2).
     const chargeLedgers = $derived(ledgers);
     const ledgerById = $derived(new Map(ledgers.map((l) => [l.id, l])));
 
@@ -134,8 +130,6 @@
         return row.ledgerId != null ? (ledgerById.get(row.ledgerId)?.kind ?? null) : null;
     }
 
-    // ── client-side PREVIEW only (server signs & rounds authoritatively) ───────
-    // Discounts first (on subtotal), then a single round-off delta on the result.
     const discountPreview = $derived.by(() => {
         let d = 0;
         for (const c of charges) {
@@ -189,7 +183,6 @@
         }
     }
 
-    // Re-fetch ledgers when the active company changes (scoped shared + own).
     $effect(() => {
         if (companyId != null && companyId !== lastLedgerCompany) void loadLedgers();
     });
@@ -199,7 +192,9 @@
         loadingHistory = true;
         try {
             const p = new URLSearchParams({company: String(companyId)});
-            const rows = await request<Sale[] | { results?: Sale[] }>(`/api/vouchers/sales/?${p.toString()}`);
+            const rows = await request<Purchase[] | {
+                results?: Purchase[]
+            }>(`/api/vouchers/purchases/?${p.toString()}`);
             history = Array.isArray(rows) ? rows : (rows?.results ?? []);
         } catch {
             history = [];
@@ -208,24 +203,22 @@
         }
     }
 
-    async function openForEdit(row: Sale) {
-        if (row.is_cancelled) return;
+    async function openForEdit(prow: Purchase) {
+        if (prow.is_cancelled) return;
         error = null;
         saved = null;
-        editingId = row.id;
-        party = {id: row.party, name: row.party_name};
-        date = row.date;
-        segregate = row.segregate;
-        lines = row.lines.map((sl) => ({
-            key: ++seq, item: {id: sl.item, name: sl.item_name}, company: sl.company_resolved,
-            qty: String(sl.qty), rate: String(sl.rate), amount: round2(Number(sl.qty) * Number(sl.rate)),
-            resolving: false, note: "",
+        editingId = prow.id;
+        party = {id: prow.party, name: prow.party_name};
+        date = prow.date;
+        lines = prow.lines.map((pl) => ({
+            key: ++seq, item: {id: pl.item, name: pl.item_name}, mapping: pl.mapping,
+            qty: String(pl.qty), rate: String(pl.rate), amount: round2(Number(pl.qty) * Number(pl.rate)),
+            resolving: false, note: "", noMapping: false, creatingMapping: false,
         }));
         if (lines.length === 0) lines = [newLine()];
-        hydrateCharges(row.charges ?? []);
+        hydrateCharges(prow.charges ?? []);
     }
 
-    // Rebuild editable charge rows from saved charges, keyed on the ledger id.
     function hydrateCharges(rows: SavedCharge[]) {
         charges = rows.map((c) => ({
             key: ++chargeSeq,
@@ -239,7 +232,6 @@
         editingId = null;
         party = null;
         date = today;
-        segregate = false;
         lines = [newLine()];
         charges = [newCharge()];
         error = null;
@@ -261,31 +253,62 @@
         setTimeout(() => (document.getElementById("date") as HTMLElement | null)?.focus(), 0);
     }
 
-    async function resolveRate(line: Line, itemId: number) {
-        const rc = line.company ?? companyId;
-        if (!rc) return;
+
+    async function resolveMapping(line: Line, itemId: number) {
+        if (!companyId) return;
         line.resolving = true;
         line.note = "";
+        line.noMapping = false;
         try {
-            const params = new URLSearchParams({item: String(itemId), company: String(rc)});
+            const params = new URLSearchParams({item: String(itemId), company: String(companyId)});
             const rows = await request<Mapping[]>(`/api/catalogue/mappings/?${params.toString()}`);
             const list = Array.isArray(rows) ? rows : ((rows as { results?: Mapping[] })?.results ?? []);
             if (list.length > 0) {
-                line.rate = String(list[0].rate ?? line.rate ?? 0);
+                line.mapping = list[0].id;
+                line.rate = String(list[0].rate ?? 0);
                 onQtyOrRate(line);
             } else {
-                line.note = "No mapping yet — server uses the default company.";
+                line.mapping = null;
+                line.noMapping = true;
+                line.note = "No mapping for this company.";
             }
         } catch (e) {
-            line.note = e instanceof Error ? e.message : "Failed to resolve rate.";
+            line.note = e instanceof Error ? e.message : "Failed to resolve mapping.";
         } finally {
             line.resolving = false;
         }
     }
 
+    async function createMapping(line: Line) {
+        if (!companyId || !line.item) return;
+        line.creatingMapping = true;
+        line.note = "";
+        try {
+            const m = await request<Mapping>("/api/catalogue/mappings/", {
+                method: "POST",
+                body: JSON.stringify({
+                    item: line.item.id,
+                    company: companyId,
+                    rate: Number(line.rate) || 0,
+                    opening_stock: 0
+                }),
+            });
+            line.mapping = m.id;
+            line.noMapping = false;
+            line.rate = String(m.rate ?? line.rate ?? 0);
+            onQtyOrRate(line);
+        } catch (e) {
+            line.note = e instanceof Error ? e.message : "Could not create mapping.";
+        } finally {
+            line.creatingMapping = false;
+        }
+    }
+
     function onItemSelect(line: Line, s: Suggestion) {
         line.item = s;
-        void resolveRate(line, s.id);
+        line.mapping = null;
+        line.noMapping = false;
+        void resolveMapping(line, s.id);
     }
 
     function onItemCreate(line: Line, t: string) {
@@ -298,7 +321,7 @@
         itemDialog = null;
         if (target) {
             target.item = i;
-            void resolveRate(target, i.id);
+            void resolveMapping(target, i.id);
             if (key != null) focusRowQty(key);
         }
     }
@@ -338,10 +361,8 @@
         setTimeout(() => document.querySelector<HTMLElement>('[data-flow="charge"]')?.focus(), 0);
     }
 
-
     // ── charge row management ─────────────────────────────────────────────────
     function addCharge() {
-        // Default the picker to the first unused charge ledger, if any.
         const used = new Set(charges.map((c) => c.ledgerId));
         const first = chargeLedgers.find((l) => !used.has(l.id)) ?? chargeLedgers[0] ?? null;
         charges = [...charges, newCharge(first?.id ?? null)];
@@ -392,6 +413,7 @@
     }
 
 
+
     function removeCharge(key: number) {
         charges = charges.filter((c) => c.key !== key);
     }
@@ -412,6 +434,7 @@
         else setTimeout(() => document.querySelector<HTMLElement>('[data-flow="charge"]')?.focus(), 0);
     }
 
+
     function focusParty() {
         setTimeout(() => partyLookup?.focus(), 0);
     }
@@ -426,9 +449,10 @@
         }, 0);
     }
 
+    // Every started line must have qty; rate may be 0 but mapping must resolve.
     function isComplete(): boolean {
         if (!party || !companyId) return false;
-        return lines.every((l) => !l.item || Number(l.qty) > 0);
+        return lines.every((l) => !l.item || (l.mapping != null && Number(l.qty) > 0));
     }
 
     const flowOpts = $derived({
@@ -442,6 +466,7 @@
             confirmOpen = true;
         },
     });
+
 
     // ── save via confirmation ─────────────────────────────────────────────────
     function requestSave() {
@@ -459,8 +484,6 @@
         focusParty();          // return focus into the flow so shortcuts keep working
     }
 
-
-    // Build the backend charge payload from the dynamic rows, driven by ledger kind.
     function buildPayloadCharges() {
         const out: Array<Record<string, unknown>> = [];
         for (const c of charges) {
@@ -473,7 +496,6 @@
             } else if (kind === "ROUND_OFF") {
                 out.push({ledger_id: c.ledgerId, charge_type: "ROUND_OFF"});
             }
-            // TAX / OTHER: v2 — skipped in v1.
         }
         return out;
     }
@@ -485,35 +507,29 @@
         saved = null;
         settleNote = null;
         try {
-            const payloadLines = lines.filter((l) => l.item && Number(l.qty) > 0).map((l) => {
-                const row: { item: number; qty: number; rate: number; company?: number } = {
-                    item: l.item!.id, qty: Number(l.qty), rate: Number(l.rate) || 0,
-                };
-                if (isMulti && l.company) row.company = l.company;
-                return row;
-            });
+            const payloadLines = lines.filter((l) => l.mapping && Number(l.qty) > 0)
+                .map((l) => ({mapping: l.mapping, qty: Number(l.qty), rate: Number(l.rate) || 0}));
             if (payloadLines.length === 0) {
                 error = "Add at least one item with a quantity.";
                 return;
             }
-            if (editingId != null) await request(`/api/vouchers/sales/${editingId}/cancel/`, {method: "POST"});
-            const res = await request<Sale>("/api/vouchers/sales/", {
+            if (editingId != null) await request(`/api/vouchers/purchases/${editingId}/cancel/`, {method: "POST"});
+            const res = await request<{ id: number; number: string; total_amount: number }>("/api/vouchers/purchases/", {
                 method: "POST",
                 body: JSON.stringify({
                     company: companyId, party: party.id, date, number: null,
-                    segregate: isMulti ? segregate : false, lines: payloadLines,
-                    charges: buildPayloadCharges(),
+                    lines: payloadLines, charges: buildPayloadCharges(),
                 }),
             });
-            saved = res;
+            saved = {number: res.number, total_amount: res.total_amount};
 
-            // Optional inline settlement — a SEPARATE, independent write. The sale
-            // is already saved; a settlement failure never rolls it back. Targets
-            // this sale only (target_bill_id), so it won't touch the party's other bills.
+            // Optional inline settlement — a SEPARATE, independent write. The purchase
+            // is already saved; a settlement failure never rolls it back. Targets this
+            // purchase only (target_bill_id), so it won't touch the party's other bills.
             const amt = Number(settleAmount) || 0;
             if (amt > 0) {
                 try {
-                    await request("/api/vouchers/received/", {
+                    await request("/api/vouchers/payments/", {
                         method: "POST",
                         body: JSON.stringify({
                             company: companyId, party: party.id, date,
@@ -523,100 +539,62 @@
                     });
                     settleNote = `Settled ${amt.toFixed(2)} against #${res.number}${settleModeName ? ` via ${settleModeName}` : ""}.`;
                 } catch (se) {
-                    settleNote = `Sale #${res.number} saved, but the settlement did not post${se instanceof Error ? `: ${se.message}` : ""}. You can settle it later from the Settle page.`;
+                    settleNote = `Purchase #${res.number} saved, but the settlement did not post${se instanceof Error ? `: ${se.message}` : ""}. You can settle it later from the Settle page.`;
                 }
             }
 
             editingId = null;
-            party = null;
-            segregate = false;
             lines = [newLine()];
             charges = [];
             settleAmount = "0";
             await loadHistory();
             focusParty();
         } catch (e) {
-            error = e instanceof Error ? e.message : "Could not save sale.";
+            error = e instanceof Error ? e.message : "Could not save purchase.";
         } finally {
             saving = false;
         }
     }
 
-    function viewDerived(row: Sale) {
-        saved = row;
-        shell.activeTab = "derived";
-    }
-
-    const shell = registerScreen(() => ({
-        title: "Sale",
+    // Register title, quick actions, history panel, and shortcuts with the shell.
+    registerScreen(() => ({
+        title: "Purchase",
         actions: [
-            {id: "sal-new", label: "New", icon: "＋", shortcut: "Ctrl+N", run: resetForm},
-            {id: "sal-add", label: "Add line", icon: "▸", shortcut: "Alt+A", run: addLine},
-            {id: "sal-charge", label: "Add charge", icon: "%", shortcut: "Alt+I", run: addCharge},
-            {id: "sal-save", label: "Save", icon: "✓", shortcut: "Ctrl+Enter", run: requestSave},
+            {id: "pur-new", label: "New", icon: "＋", shortcut: "Ctrl+N", run: resetForm},
+            {id: "pur-add", label: "Add line", icon: "▸", shortcut: "Alt+A", run: addLine},
+            {id: "pur-charge", label: "Add charge", icon: "%", shortcut: "Alt+I", run: addCharge},
+            {id: "pur-save", label: "Save", icon: "✓", shortcut: "Ctrl+Enter", run: requestSave},
         ],
         shortcuts: [
-            {id: "sal-k-new", keychord: "ctrl+n", label: "New", run: resetForm},
-            {id: "sal-k-add", keychord: "alt+a", label: "Add line", run: addLine},
-            {id: "sal-k-charge", keychord: "alt+i", label: "Add charge", run: addCharge},
-            {id: "sal-k-focus-charge", keychord: "alt+g", label: "Focus charges", run: focusCharges},
+            {id: "pur-k-new", keychord: "ctrl+n", label: "New", run: resetForm},
+            {id: "pur-k-add", keychord: "alt+a", label: "Add line", run: addLine},
+            {id: "pur-k-charge", keychord: "alt+i", label: "Add charge", run: addCharge},
+            {id: "pur-k-focus-charge", keychord: "alt+g", label: "Focus charges", run: focusCharges},
         ],
-        panel: [
-            {id: "history", title: "History", body: historyPanel},
-            {id: "derived", title: "Derived", body: derivedPanel},
-        ],
+        panel: [{id: "history", title: "History", body: historyPanel}],
     }));
 </script>
 
 {#snippet historyPanel()}
     <div class="sidehead">
-        <span class="muted">Recent sales</span>
+        <span class="muted">Recent purchases</span>
         <button class="refresh" onclick={loadHistory} disabled={loadingHistory}>{loadingHistory ? "…" : "↻"}</button>
     </div>
     {#if history.length === 0}
-        <p class="muted">{loadingHistory ? "Loading…" : "No sales yet."}</p>
+        <p class="muted">{loadingHistory ? "Loading…" : "No purchases yet."}</p>
     {:else}
         <ul class="hlist">
             {#each history as h (h.id)}
                 <li class:cancelled={h.is_cancelled} class:active={h.id === editingId}>
-                    <div class="hrow">
-                        <button class="hmain" disabled={h.is_cancelled} onclick={() => openForEdit(h)}>
-                            <div class="hline1"><span>#{h.number}</span><span
-                                    class="htot">{Number(h.total_amount).toFixed(2)}</span></div>
-                            <div class="hline2"><span>{h.party_name}</span><span>{h.date}</span></div>
-                        </button>
-                        <button class="viewbtn" title="View derived" onclick={() => viewDerived(h)}>▣</button>
+                    <button class="hrow" disabled={h.is_cancelled} onclick={() => openForEdit(h)}>
+                        <div class="hline1"><span>#{h.number}</span><span
+                                class="htot">{Number(h.total_amount).toFixed(2)}</span></div>
+                        <div class="hline2"><span>{h.party_name}</span><span>{h.date}</span></div>
                         {#if h.is_cancelled}<span class="badge">cancelled</span>{/if}
-                    </div>
+                    </button>
                 </li>
             {/each}
         </ul>
-    {/if}
-{/snippet}
-
-{#snippet derivedPanel()}
-    {#if !saved}
-        <p class="muted">Save a sale or pick one from History to see its company-sales.</p>
-    {:else}
-        <div class="sidehead"><span class="muted">Master #{saved.number}
-            · {Number(saved.total_amount).toFixed(2)}</span></div>
-        {#if saved.derived.length === 0}
-            <p class="muted">No derived sales.</p>
-        {:else}
-            {#each saved.derived as d (d.id)}
-                <div class="derived">
-                    <div class="dhead"><span>#{d.number}</span><span
-                            class="dtot">{Number(d.total_amount).toFixed(2)}</span></div>
-                    <div class="dlines">
-                        {#each d.lines as dl (dl.id)}
-                            <div class="dline"><span>{dl.item_name}</span>
-                                <span class="rt">{Number(dl.qty)}×{Number(dl.rate).toFixed(2)}</span>
-                                <span class="rt">{Number(dl.amount).toFixed(2)}</span></div>
-                        {/each}
-                    </div>
-                </div>
-            {/each}
-        {/if}
     {/if}
 {/snippet}
 
@@ -627,8 +605,8 @@
         </div>
     {/if}
     {#if saved}
-        <div class="banner ok">Saved sale <strong>#{saved.number}</strong> · total
-            <strong>{Number(saved.total_amount).toFixed(2)}</strong>. See <strong>Derived</strong> panel.
+        <div class="banner ok">Saved purchase <strong>#{saved.number}</strong> · total
+            <strong>{saved.total_amount}</strong>.
         </div>
     {/if}
     {#if error}
@@ -638,17 +616,14 @@
     <section class="head">
         <div class="field">
             <label for="party">Party</label>
-            <SmartLookup type="PARTY" flow="party" placeholder="Search or create party…" value={party}
-                         bind:this={partyLookup}
-                         onselect={onPartySelect} oncreate={onPartyCreate}/>
+            <SmartLookup bind:this={partyLookup} flow="party" oncreate={onPartyCreate} onselect={onPartySelect}
+                         placeholder="Search or create party…"
+                         type="PARTY" value={party}/>
         </div>
         <div class="field date">
             <label for="date">Date</label>
-            <input id="date" type="date" data-flow="date" bind:value={date}/>
+            <input bind:value={date} data-flow="date" id="date" type="date"/>
         </div>
-        {#if isMulti}
-            <label class="seg"><input type="checkbox" bind:checked={segregate}/> Segregate</label>
-        {/if}
     </section>
 
     <section class="grid">
@@ -663,7 +638,11 @@
                                  oncreate={(t) => onItemCreate(line, t)}
                                  onemptyenter={() => onLineEmptyEnter(line)}
                     />
-                    {#if line.resolving}<span class="hint">Resolving rate…</span>
+                    {#if line.resolving}<span class="hint">Resolving mapping…</span>
+                    {:else if line.noMapping}
+                        <span class="hint warn">{line.note}
+                            <button class="linkbtn" disabled={line.creatingMapping} onclick={() => createMapping(line)}>
+                                {line.creatingMapping ? "Creating…" : "Create mapping"}</button></span>
                     {:else if line.note}<span class="hint warn">{line.note}</span>{/if}
                 </div>
                 <div class="qtycell">
@@ -719,8 +698,8 @@
                 <button class="del" title="Remove charge" onclick={() => removeCharge(c.key)}>✕</button>
             </div>
         {/each}
-        <button class="addline" onclick={addCharge}
-                disabled={chargeLedgers.length === 0}>+ Add charge <kbd>Alt I</kbd></button>
+        <button class="addline" disabled={chargeLedgers.length === 0}
+                onclick={addCharge}>+ Add charge <kbd>Alt I</kbd></button>
     </section>
 
     <section class="totals">
@@ -736,8 +715,8 @@
     </section>
 
     <footer class="foot">
-        <button class="save" type="button" data-flow="save" disabled={!canSave} onclick={requestSave}>
-            {saving ? "Saving…" : (editingId != null ? "Save changes" : "Save sale")} <kbd>Ctrl ⏎</kbd>
+        <button class="save" data-flow="save" disabled={!canSave} onclick={requestSave} type="button">
+            {saving ? "Saving…" : (editingId != null ? "Save changes" : "Save purchase")} <kbd>Ctrl ⏎</kbd>
         </button>
     </footer>
 
@@ -755,7 +734,7 @@
                               placeholder="Settlement mode…" onselect={(id) => (settleModeId = id)}/>
             </div>
         </div>
-        <p class="settle-hint">Leave amount at 0 to save the sale without settling. Any amount here settles this sale only.</p>
+        <p class="settle-hint">Leave amount at 0 to save the purchase without settling. Any amount here settles this purchase only.</p>
         {#if settleNote}<div class="settle-note">{settleNote}</div>{/if}
     </section>
 </div>
@@ -770,9 +749,9 @@
 {/if}
 {#if confirmOpen}
     <ConfirmDialog
-            title={editingId != null ? "Replace this sale?" : "Confirm sale"}
+            title={editingId != null ? "Replace this purchase?" : "Confirm purchase"}
             message={`Party: ${party?.name ?? "—"} · Final bill ${finalBill.toFixed(2)}. ${editingId != null ? "The original will be cancelled and replaced." : "Post this voucher?"}${Number(settleAmount) > 0 ? ` Then settle ${Number(settleAmount).toFixed(2)}${settleModeName ? ` via ${settleModeName}` : ""} against it.` : ""}`}
-            confirmLabel={editingId != null ? "Replace" : "Post sale"}
+            confirmLabel={editingId != null ? "Replace" : "Post purchase"}
             busy={saving}
             onconfirm={confirmSave}
             oncancel={closeConfirm}/>
@@ -815,9 +794,8 @@
     .head {
         display: flex;
         gap: 18px;
-        align-items: flex-end;
         margin-bottom: 22px;
-        max-width: 720px;
+        max-width: 640px;
     }
 
     .field {
@@ -829,16 +807,6 @@
 
     .field.date {
         max-width: 180px;
-    }
-
-    .seg {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 13px;
-        color: var(--text);
-        padding-bottom: 8px;
-        white-space: nowrap;
     }
 
     label {
@@ -888,6 +856,10 @@
     .hint {
         font-size: 11px;
         color: var(--text-muted);
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        align-items: center;
     }
 
     .hint.warn {
@@ -1100,6 +1072,7 @@
         margin-left: 6px;
     }
 
+    /* history panel (rendered inside shell ContextPanel) */
     .sidehead {
         display: flex;
         justify-content: space-between;
@@ -1133,12 +1106,18 @@
 
     .hrow {
         position: relative;
-        display: flex;
-        gap: 6px;
+        width: 100%;
+        text-align: left;
         background: var(--bg-app);
         border: 1px solid var(--border);
         border-radius: var(--radius);
-        padding: 4px;
+        padding: 8px 10px;
+        cursor: pointer;
+        color: var(--text);
+    }
+
+    .hrow:disabled {
+        cursor: default;
     }
 
     li.active .hrow {
@@ -1147,35 +1126,6 @@
 
     li.cancelled .hrow {
         opacity: .55;
-    }
-
-    .hmain {
-        flex: 1;
-        text-align: left;
-        background: transparent;
-        border: none;
-        cursor: pointer;
-        color: var(--text);
-        padding: 4px 6px;
-    }
-
-    .hmain:disabled {
-        cursor: default;
-    }
-
-    .viewbtn {
-        background: transparent;
-        border: 1px solid var(--border-hi);
-        color: var(--text-muted);
-        border-radius: 6px;
-        cursor: pointer;
-        width: 30px;
-        flex-shrink: 0;
-    }
-
-    .viewbtn:hover {
-        border-color: var(--accent-text);
-        color: var(--accent-text);
     }
 
     .hline1 {
@@ -1207,43 +1157,6 @@
         background: var(--danger-soft);
         padding: 1px 5px;
         border-radius: 4px;
-    }
-
-    .derived {
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        margin-bottom: 10px;
-        overflow: hidden;
-    }
-
-    .dhead {
-        display: flex;
-        justify-content: space-between;
-        padding: 8px 12px;
-        border-bottom: 1px solid var(--border);
-        font-size: 13px;
-        font-weight: 600;
-    }
-
-    .dtot {
-        color: var(--ok);
-    }
-
-    .dlines {
-        padding: 4px 12px 8px;
-    }
-
-    .dline {
-        display: grid;
-        grid-template-columns: 1fr auto auto;
-        gap: 10px;
-        padding: 4px 0;
-        font-size: 12px;
-        color: var(--text-muted);
-    }
-
-    .rt {
-        text-align: right;
     }
     /* ── optional inline settlement (matches the charges section) ── */
     .settle-inline {
