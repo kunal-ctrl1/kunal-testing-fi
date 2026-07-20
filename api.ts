@@ -1,19 +1,15 @@
-async function submit(e: Event) {
-    e.preventDefault();
-    if (busy) return;
-    if (!startDate || !endDate) return;
-    if (new Date(endDate) <= new Date(startDate)) {
-      error = "End date must be after the start date.";
-      return;
-    }
-    busy = true;
-    error = null;
-    try {
-      await auth.ensureFy(startDate, endDate);
-      await goto("/app");
-    } catch (err) {
-      error =
-        err instanceof ApiError ? err.message : "Could not create the financial year.";
-      busy = false; // on success we navigate away, so only reset on failure
-    }
-  }
+/**
+ * A soft issue surfaced by the pre-save WarningDialog.
+ * Each screen implements `collectIssues(): Issue[]` in visual/flow order
+ * (top of form → bottom) so `issues[0].focus()` targets the first problem.
+ */
+export type Issue = {
+    /** Stable identifier, e.g. "line-qty-zero", "settle-no-mode". */
+    code: string;
+    /** Human-readable message shown in the dialog list. */
+    message: string;
+    /** Focuses the offending input when the user picks "Review & fix". */
+    focus: () => void;
+    /** "warn" = saveable but suspicious; "block" = hides "Save anyway". Default: "warn". */
+    severity?: "warn" | "block";
+};
