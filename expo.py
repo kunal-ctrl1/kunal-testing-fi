@@ -1,85 +1,47 @@
 from django.db import transaction
-from django.db.models import Sum
 from decimal import Decimal
 
 from apps.common.exceptions import DomainError
-from ..models import Allocation, SaleMaster, Purchase
-from ..selectors import open_sales, open_purchases
+from apps.parties.services import post_entry
+from ..models import Received, Payment
+from .numbering import next_number
+from .reconciliation import (
+    apply_receipt, apply_payment,
+    apply_receipt_to_bill, apply_payment_to_bill,
+)
 
 
 @transaction.atomic
-def apply_receipt(received):
-    _allocate(received.party, received.amount, "RECEIVED", received.id,
-              "SALE", open_sales)
-
-
-@transaction.atomic
-def apply_payment(payment):
-    _allocate(payment.party, payment.amount, "PAYMENT", payment.id,
-              "PURCHASE", open_purchases)
-
-
-@transaction.atomic
-def apply_receipt_to_bill(received, bill_id):
-    """Settle ONLY the given sale (used by inline sale settlement)."""
-    _allocate_to_bill(received.party, received.amount, "RECEIVED", received.id,
-                      "SALE", SaleMaster, bill_id)
-
-
-@transaction.atomic
-def apply_payment_to_bill(payment, bill_id):
-    """Settle ONLY the given purchase (used by inline purchase settlement)."""
-    _allocate_to_bill(payment.party, payment.amount, "PAYMENT", payment.id,
-                      "PURCHASE", Purchase, bill_id)
-
-
-def _allocate(party, amount, settlement_type, settlement_id, bill_type, open_fn):
-    remaining = Decimal(str(amount))
-    for bill, pending in open_fn(party):
-        if remaining <= 0:
-            break
-        take = min(remaining, pending)
-        Allocation.objects.create(
-            settlement_type=settlement_type, settlement_id=settlement_id,
-            bill_type=bill_type, bill_id=bill.id, amount=take,
-        )
-        remaining -= take
-
-
-def _bill_pending(bill_type, bill_id, bill_total):
-    agg = Allocation.objects.filter(
-        bill_type=bill_type, bill_id=bill_id, is_reversal=False
-    ).aggregate(s=Sum("amount"))
-    return bill_total - (agg["s"] or Decimal("0.00"))
-
-
-def _allocate_to_bill(party, amount, settlement_type, settlement_id,
-                      bill_type, bill_model, bill_id):
-    """Allocate against ONE specific bill only. Any excess over that bill's
-    pending stays unallocated (on account) rather than spilling onto other
-    open bills — that spill-over is what the Settle page is for."""
-    bill = bill_model.objects.filter(
-        pk=bill_id, party=party, is_cancelled=False
-    ).first()
-    if bill is None:
-        raise DomainError("Target bill not found for this party.")
-    pending = _bill_pending(bill_type, bill.id, bill.total_amount)
-    take = min(Decimal(str(amount)), pending)
-    if take > 0:
-        Allocation.objects.create(
-            settlement_type=settlement_type, settlement_id=settlement_id,
-            bill_type=bill_type, bill_id=bill.id, amount=take,
-        )
-
-
-@transaction.atomic
-def reverse_allocations(settlement_type, settlement_id):
-    allocs = Allocation.objects.filter(
-        settlement_type=settlement_type, settlement_id=settlement_id, is_reversal=False
+def create_received(user, company, fy, party, date, amount, number=None, mode=None, target_bill_id=None):
+    if not fy.is_writable:
+        raise DomainError("Financial year is not writable.")
+    amount = Decimal(str(amount))
+    num = next_number(company, fy, "RECEIVED", manual=number)
+    r = Received.objects.create(
+        company=company, financial_year=fy, party=party, date=date,
+        number=num, amount=amount, total_amount=amount, mode=mode, created_by=user,
     )
-    for a in allocs:
-        Allocation.objects.create(
-            settlement_type=settlement_type, settlement_id=settlement_id,
-            bill_type=a.bill_type, bill_id=a.bill_id,
-            amount=-a.amount, is_reversal=True,
-        )
+    post_entry(party, date, fy, "RECEIVED", r.id, debit=amount)
+    if target_bill_id is not None:
+        apply_receipt_to_bill(r, target_bill_id)
+    else:
+        apply_receipt(r)
+    return r
+
+
+@transaction.atomic
+def create_payment(user, company, fy, party, date, amount, number=None, mode=None, target_bill_id=None):
+    if not fy.is_writable:
+        raise DomainError("Financial year is not writable.")
+    amount = Decimal(str(amount))
+    num = next_number(company, fy, "PAYMENT", manual=number)
+    p = Payment.objects.create(
+        company=company, financial_year=fy, party=party, date=date,
+        number=num, amount=amount, total_amount=amount, mode=mode, created_by=user,
+    )
+    post_entry(party, date, fy, "PAYMENT", p.id, credit=amount)
+    if target_bill_id is not None:
+        apply_payment_to_bill(p, target_bill_id)
+    else:
+        apply_payment(p)
+    return p
