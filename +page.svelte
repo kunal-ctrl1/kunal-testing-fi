@@ -1,164 +1,539 @@
 <script lang="ts">
-    import { onMount } from "svelte";
-    import type { Issue } from "$lib/validation";
+    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
+    import WarningDialog from "$lib/components/WarningDialog.svelte";
+    import type {Issue} from "$lib/validation";
+    import {enterFlow} from "$lib/flow";
+    import {auth} from "$lib/stores/auth.svelte";
+    import {goto} from "$app/navigation";
+    import {onMount} from "svelte";
+    import {request, type Suggestion} from "$lib/api";
+    import SmartLookup from "$lib/components/SmartLookup.svelte";
+    import LedgerLookup from "$lib/components/LedgerLookup.svelte";
+    import PartyCreateDialog from "$lib/components/PartyCreateDialog.svelte";
+    import {registerScreen} from "$lib/shell/useScreen.svelte";
 
-    type Props = {
-        issues: Issue[];
-        onreview: () => void;
-        onproceed: () => void;
-        oncancel: () => void;
-    };
-    let {
-        issues,
-        onreview,
-        onproceed,
-        oncancel,
-    }: Props = $props();
-
-    let armed = $state(false);
-
-    // Ignore the Enter keystroke that opened this dialog; arm on the next tick.
     onMount(() => {
-        const id = setTimeout(() => (armed = true), 0);
-        return () => clearTimeout(id);
+        if (!auth.isAuthed) return void goto("/login");
+        if (auth.needsSetup) return void goto("/setup");
+        if (auth.needsFy) return void goto("/fy");
+        void loadModes();
+        void loadHistory();
     });
 
-    function focusOnMount(node: HTMLElement) {
-        node.focus();
+    type Kind = "PAYMENT" | "RECEIVED";
+    type Allocation = {
+        id: number; bill_type: string; bill_id: number; bill_number: string | null;
+        bill_date: string | null; bill_total: number | null; amount: number;
+    };
+    type SettleResult = { id: number; number: string; amount: number; allocations: Allocation[]; };
+    type Voucher = {
+        id: number; party: number; party_name: string; number: string;
+        date: string; amount: number; is_cancelled: boolean;
+    };
+    type OpenBill = {
+        bill_type: string; bill_id: number; number: string;
+        date: string; total: number; settled: number; open: number;
+    };
+    type OpenBills = { outstanding_total: number; bills: OpenBill[] };
+    type SettlementMode = {
+        id: number; name: string; is_system: boolean; is_active: boolean; sort_order: number;
+    };
+
+    const today = new Date().toISOString().slice(0, 10);
+    let kind = $state<Kind>("PAYMENT");
+    let party = $state<Suggestion | null>(null);
+    let date = $state(today);
+    let amount = $state("0");
+    let saving = $state(false);
+    let error = $state<string | null>(null);
+    let result = $state<SettleResult | null>(null);
+    let history = $state<Voucher[]>([]);
+    let loadingHistory = $state(false);
+    let selectedId = $state<number | null>(null);
+    let preview = $state<OpenBills | null>(null);
+    let loadingPreview = $state(false);
+    let partyDialog = $state<string | null>(null);
+    let modes = $state<SettlementMode[]>([]);
+    let modeId = $state<number | null>(null);
+
+    const companyId = $derived(auth.currentCompany?.id ?? null);
+    const endpoint = $derived(kind === "PAYMENT" ? "/api/vouchers/payments/" : "/api/vouchers/received/");
+    const canSave = $derived(!!party && !!companyId && Number(amount) > 0 && !saving);
+    const allocated = $derived((result?.allocations ?? []).reduce((s, a) => s + (Number(a.amount) || 0), 0));
+    const unallocated = $derived(result ? Math.max(0, (Number(result.amount) || 0) - allocated) : 0);
+    const modeOptions = $derived(modes.filter((m) => m.is_active).map((m) => ({id: m.id, name: m.name})));
+
+    let confirmOpen = $state(false);
+    let warningIssues = $state<Issue[] | null>(null);
+    let warningNext = $state<(() => void) | null>(null);
+
+    // Party, positive amount, and a date are the potential fields.
+    function isComplete(): boolean {
+        return !!party && !!companyId && Number(amount) > 0 && !!date;
     }
 
-    const hasBlock = $derived(issues.some((i) => i.severity === "block"));
+    // ── pre-save validation (soft warnings, not hard blocks) ──────────────────
+    function collectIssues(): Issue[] {
+        const issues: Issue[] = [];
+        const amt = Number(amount) || 0;
 
-    function onBackdropClick(e: MouseEvent) {
-        if (e.target === e.currentTarget) oncancel();
+        if (amt > 0 && modeId == null) {
+            issues.push({
+                code: "settle-no-mode",
+                message: "No settlement mode selected.",
+                focus: () => document.getElementById("amount")?.focus(),
+            });
+        }
+
+        const outstanding = Number(preview?.outstanding_total ?? 0);
+        if (amt > 0 && outstanding > 0 && amt > outstanding) {
+            issues.push({
+                code: "settle-overpay",
+                message: `Amount (${amt.toFixed(2)}) exceeds the outstanding total (${outstanding.toFixed(2)}). The excess will remain as an advance on account.`,
+                focus: () => { const el = document.getElementById("amount") as HTMLInputElement | null; el?.focus(); el?.select(); },
+            });
+        }
+
+        return issues;
     }
 
-    function onKey(e: KeyboardEvent) {
-        if (e.key === "Escape") {
-            e.preventDefault();
-            e.stopPropagation();
-            oncancel();
-        } else if (e.key === "Enter") {
-            if (!armed) return;
-            e.preventDefault();
-            e.stopPropagation();
-            onreview();
+    // ── save flow: warning → confirm → save ───────────────────────────────────
+    function attemptSave(via: "confirm" | "direct") {
+        if (!canSave) return;
+        const issues = collectIssues();
+        if (issues.length > 0) {
+            warningIssues = issues;
+            warningNext = via === "confirm" ? () => { confirmOpen = true; } : () => { void save(); };
+        } else if (via === "confirm") {
+            confirmOpen = true;
+        } else {
+            void save();
         }
     }
+
+    function closeWarning() {
+        warningIssues = null;
+        warningNext = null;
+        setTimeout(() => (document.getElementById("amount") as HTMLElement | null)?.focus(), 0);
+    }
+
+    function reviewWarning() {
+        const first = warningIssues?.[0];
+        warningIssues = null;
+        warningNext = null;
+        first?.focus();
+    }
+
+    function proceedWarning() {
+        const next = warningNext;
+        warningIssues = null;
+        warningNext = null;
+        next?.();
+    }
+
+    function requestSave() {
+        attemptSave("confirm");
+    }
+
+    async function confirmSave() {
+        confirmOpen = false;
+        await save();
+    }
+
+    function closeConfirm() {
+        confirmOpen = false;
+        setTimeout(() => (document.getElementById("amount") as HTMLElement | null)?.focus(), 0);
+    }
+
+
+    const flowOpts = $derived({
+        onSave: (_opts: { direct: boolean }) => { attemptSave("direct"); },
+        isComplete,
+        onConfirm: () => { attemptSave("confirm"); },
+    });
+
+    // Live preview: how much of `amount` will settle which open bills (oldest->latest).
+    const previewPlan = $derived.by(() => {
+        if (!preview) return [];
+        let remaining = Number(amount) || 0;
+        return preview.bills.map((b) => {
+            const take = Math.min(remaining, Number(b.open));
+            remaining = Math.max(0, remaining - take);
+            return {...b, willSettle: take};
+        });
+    });
+
+    function onPartySelect(s: Suggestion) {
+        party = s;
+        void loadHistory();
+        void loadPreview();
+    }
+
+    function onPartyCreate(t: string) {
+        partyDialog = t;
+    }
+
+    function onPartyCreated(p: Suggestion) {
+        party = p;
+        partyDialog = null;
+        void loadHistory();
+        void loadPreview();
+    }
+
+    function setKind(k: Kind) {
+        if (k === kind) return;
+        kind = k;
+        result = null;
+        error = null;
+        selectedId = null;
+        void loadHistory();
+        void loadPreview();
+    }
+
+    // User-level settlement modes (Cash/UPI/…). Loaded once; shared by both kinds.
+    async function loadModes() {
+        try {
+            const rows = await request<SettlementMode[] | { results?: SettlementMode[] }>(
+                "/api/accounts/settlement-modes/"
+            );
+            modes = Array.isArray(rows) ? rows : (rows?.results ?? []);
+            if (modeId == null) {
+                const active = modes.filter((m) => m.is_active);
+                const sys = active.find((m) => m.is_system);
+                modeId = sys?.id ?? active[0]?.id ?? null;
+            }
+        } catch {
+            modes = [];
+        }
+    }
+
+    function onModeSelect(id: number) {
+        modeId = id;
+    }
+
+    async function loadHistory() {
+        if (!companyId) return;
+        loadingHistory = true;
+        try {
+            const p = new URLSearchParams({company: String(companyId)});
+            if (party) p.set("party", String(party.id));
+            const rows = await request<Voucher[] | { results?: Voucher[] }>(`${endpoint}?${p.toString()}`);
+            history = Array.isArray(rows) ? rows : (rows?.results ?? []);
+        } catch {
+            history = [];
+        } finally {
+            loadingHistory = false;
+        }
+    }
+
+    // New backend contract: GET /api/vouchers/{payments|received}/open_bills/?party=
+    async function loadPreview() {
+        if (!party) {
+            preview = null;
+            return;
+        }
+        loadingPreview = true;
+        try {
+            const p = new URLSearchParams({party: String(party.id)});
+            preview = await request<OpenBills>(`${endpoint}open_bills/?${p.toString()}`);
+            shell.activeTab = "allocation";
+        } catch {
+            preview = null;
+        } finally {
+            loadingPreview = false;
+        }
+    }
+
+    async function viewVoucher(v: Voucher) {
+        selectedId = v.id;
+        error = null;
+        try {
+            const allocs = await request<Allocation[]>(`${endpoint}${v.id}/allocations/`);
+            result = {id: v.id, number: v.number, amount: Number(v.amount), allocations: allocs ?? []};
+            shell.activeTab = "allocation";
+        } catch (e) {
+            error = e instanceof Error ? e.message : "Could not load allocations.";
+        }
+    }
+
+    async function save() {
+        if (!party || !companyId || saving) return;
+        saving = true;
+        error = null;
+        result = null;
+        selectedId = null;
+        try {
+            const res = await request<SettleResult>(endpoint, {
+                method: "POST",
+                body: JSON.stringify({
+                    company: companyId,
+                    party: party.id,
+                    date,
+                    amount: Number(amount),
+                    mode: modeId,
+                    number: null
+                }),
+            });
+            result = {id: res.id, number: res.number, amount: Number(res.amount), allocations: res.allocations ?? []};
+            amount = "0";
+            await loadHistory();
+            await loadPreview();
+            shell.activeTab = "allocation";
+        } catch (e) {
+            error = e instanceof Error ? e.message : "Could not save.";
+        } finally {
+            saving = false;
+        }
+    }
+
+    const shell = registerScreen(() => ({
+        title: "Settle",
+        actions: [
+            {id: "set-save", label: "Save", icon: "✓", shortcut: "Ctrl+Enter", run: requestSave},
+        ],
+        shortcuts: [],
+        panel: [
+            {id: "allocation", title: "Allocation", body: allocationPanel},
+            {id: "history", title: "History", body: historyPanel},
+        ],
+    }));
 </script>
 
-<svelte:window onkeydown={onKey}/>
+{#snippet allocationPanel()}
+    {#if result}
+        <div class="banner ok">#{result.number} · {result.amount.toFixed(2)}</div>
+        <h3>Settled</h3>
+        {#if result.allocations.length === 0}
+            <p class="muted">No open bills settled. Kept on account.</p>
+        {:else}
+            {#each result.allocations as a (a.id)}
+                <div class="arow"><span>#{a.bill_number ?? a.bill_id}</span>
+                    <span class="rt">{Number(a.amount).toFixed(2)}</span></div>
+            {/each}
+            <div class="sumline"><span>Allocated</span><strong>{allocated.toFixed(2)}</strong></div>
+            {#if unallocated > 0}
+                <div class="sumline adv"><span>On account</span><strong>{unallocated.toFixed(2)}</strong></div>
+            {/if}
+        {/if}
+    {:else if !party}
+        <p class="muted">Pick a party to preview open {kind === "PAYMENT" ? "purchases" : "sales"}.</p>
+    {:else if loadingPreview}
+        <p class="muted">Loading open bills…</p>
+    {:else if preview}
+        <h3>Open bills · outstanding {Number(preview.outstanding_total).toFixed(2)}</h3>
+        {#if preview.bills.length === 0}
+            <p class="muted">Nothing outstanding.</p>
+        {:else}
+            <div class="ahead"><span>Bill</span><span class="rt">Open</span><span class="rt">Will settle</span></div>
+            {#each previewPlan as b (b.bill_id)}
+                <div class="arow"><span>#{b.number}</span>
+                    <span class="rt">{Number(b.open).toFixed(2)}</span>
+                    <span class="rt" class:hot={b.willSettle > 0}>{b.willSettle.toFixed(2)}</span></div>
+            {/each}
+        {/if}
+    {/if}
+{/snippet}
 
-<div class="backdrop" role="presentation" onclick={onBackdropClick}>
-    <div class="dialog" role="dialog" aria-modal="true">
-        <h2>⚠ Heads up</h2>
-        <ul class="issues">
-            {#each issues as issue (issue.code)}
-                <li class:block={issue.severity === "block"}>
-                    <span class="dot">{issue.severity === "block" ? "✕" : "!"}</span>
-                    <span>{issue.message}</span>
+{#snippet historyPanel()}
+    <div class="sidehead">
+        <span class="muted">{kind === "PAYMENT" ? "Payments" : "Receipts"}{party ? ` · ${party.name}` : ""}</span>
+        <button class="refresh" onclick={loadHistory} disabled={loadingHistory}>{loadingHistory ? "…" : "↻"}</button>
+    </div>
+    {#if history.length === 0}
+        <p class="muted">{loadingHistory ? "Loading…" : "No records."}</p>
+    {:else}
+        <ul class="hlist">
+            {#each history as v (v.id)}
+                <li class:cancelled={v.is_cancelled} class:active={v.id === selectedId}>
+                    <button class="hrow-btn" onclick={() => viewVoucher(v)}>
+                        <div class="hline1"><span>#{v.number}</span><span
+                                class="htot">{Number(v.amount).toFixed(2)}</span></div>
+                        <div class="hline2"><span>{v.party_name}</span><span>{v.date}</span></div>
+                        {#if v.is_cancelled}<span class="badge">cancelled</span>{/if}
+                    </button>
                 </li>
             {/each}
         </ul>
-        <div class="row">
-            <button type="button" class="ghost" onclick={oncancel}>Cancel <kbd>Esc</kbd></button>
-            {#if !hasBlock}
-                <button type="button" class="ghost" onclick={onproceed}>Save anyway</button>
-            {/if}
-            <button type="button" onclick={onreview} use:focusOnMount>Review & fix <kbd>⏎</kbd></button>
-        </div>
+    {/if}
+{/snippet}
+
+<div class="wrap" use:enterFlow={flowOpts}>
+    <div class="toggle">
+        <button class:active={kind === "PAYMENT"} onclick={() => setKind("PAYMENT")}>Payment</button>
+        <button class:active={kind === "RECEIVED"} onclick={() => setKind("RECEIVED")}>Received</button>
     </div>
+    <p class="sub">{kind === "PAYMENT"
+        ? "Pay a vendor. Auto-settles open purchases oldest → latest."
+        : "Receive from a customer. Auto-settles open sales oldest → latest."}</p>
+
+    {#if error}
+        <div class="banner err">{error}</div>
+    {/if}
+
+    <section class="head">
+        <div class="field">
+            <label for="party">Party</label>
+            <SmartLookup flow="party" oncreate={onPartyCreate} onselect={onPartySelect} placeholder="Search or create party…"
+                         type="PARTY" value={party}/>
+        </div>
+        <div class="field amt">
+            <label for="amount">Amount</label>
+            <input bind:value={amount} class="num" data-flow="amount" id="amount" min="0" step="0.01" type="number"/>
+        </div>
+        <div class="field mode">
+            <label for="mode">Mode</label>
+            <LedgerLookup bind:value={modeId} flow="mode" onselect={onModeSelect} options={modeOptions}
+                          placeholder="Settlement mode…"/>
+        </div>
+        <div class="field date">
+            <label for="date">Date</label>
+            <input bind:value={date} data-flow="date" id="date" type="date"/>
+        </div>
+    </section>
+
+    <footer class="foot">
+        <button class="save" data-flow="save" disabled={!canSave} onclick={requestSave} type="button">
+            {saving ? "Saving…" : `Save ${kind === "PAYMENT" ? "payment" : "receipt"}`} <kbd>Ctrl ⏎</kbd>
+        </button>
+    </footer>
 </div>
 
+{#if partyDialog !== null}
+    <PartyCreateDialog initialName={partyDialog} oncreated={onPartyCreated} oncancel={() => (partyDialog = null)}/>
+{/if}
+{#if warningIssues}
+    <WarningDialog issues={warningIssues}
+                   onreview={reviewWarning}
+                   onproceed={proceedWarning}
+                   oncancel={closeWarning}/>
+{/if}
+{#if confirmOpen}
+    <ConfirmDialog
+            title={kind === "PAYMENT" ? "Confirm payment" : "Confirm receipt"}
+            message={`Party: ${party?.name ?? "—"} · Amount ${Number(amount).toFixed(2)}. Auto-settle oldest → latest?`}
+            confirmLabel={kind === "PAYMENT" ? "Post payment" : "Post receipt"}
+            busy={saving}
+            onconfirm={confirmSave}
+            oncancel={closeConfirm}/>
+{/if}
+
 <style>
-    .backdrop {
-        position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, .55);
-        display: grid;
-        place-items: center;
-        z-index: 60;
+    .wrap {
+        padding: 20px 28px 40px;
+        box-sizing: border-box;
+        max-width: 760px;
     }
 
-    .dialog {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        width: 400px;
-        padding: 22px;
-        background: #171a21;
+    .toggle {
+        display: inline-flex;
         border: 1px solid var(--border-hi);
-        border-radius: 12px;
-        color: #e6e8ec;
+        border-radius: var(--radius);
+        overflow: hidden;
+        margin-bottom: 8px;
     }
 
-    h2 {
-        margin: 0;
-        font-size: 17px;
-        color: #fbbf24;
+    .toggle button {
+        padding: 8px 18px;
+        background: transparent;
+        border: none;
+        color: var(--text-muted);
+        cursor: pointer;
+        font-size: 14px;
     }
 
-    .issues {
-        margin: 0;
-        padding: 0;
-        list-style: none;
+    .toggle button.active {
+        background: var(--accent);
+        color: #fff;
+    }
+
+    .sub {
+        color: var(--text-muted);
+        font-size: 13px;
+        margin: 0 0 18px;
+    }
+
+    .banner {
+        padding: 10px 14px;
+        border-radius: var(--radius);
+        margin-bottom: 16px;
+        font-size: 14px;
+    }
+
+    .banner.ok {
+        background: var(--ok-soft);
+        color: var(--ok);
+        border: 1px solid var(--ok-border);
+    }
+
+    .banner.err {
+        background: var(--danger-soft);
+        color: #ff9b9b;
+        border: 1px solid var(--danger-border);
+    }
+
+    .head {
+        display: flex;
+        gap: 18px;
+        margin-bottom: 20px;
+    }
+
+    .field {
+        flex: 1;
         display: flex;
         flex-direction: column;
         gap: 6px;
     }
 
-    .issues li {
-        display: flex;
-        align-items: flex-start;
-        gap: 8px;
-        font-size: 13px;
+    .field.amt {
+        max-width: 200px;
+    }
+
+    .field.mode {
+        max-width: 200px;
+    }
+
+    .field.date {
+        max-width: 180px;
+    }
+
+    label {
+        font-size: 12px;
         color: var(--text-muted);
-        line-height: 1.45;
     }
 
-    .issues li.block {
-        color: #ff9b9b;
+    .num, input[type="date"] {
+        padding: 8px 10px;
+        border-radius: var(--radius);
+        border: 1px solid var(--border-hi);
+        background: var(--bg-app);
+        color: var(--text);
+        font-size: 14px;
+        box-sizing: border-box;
     }
 
-    .dot {
-        flex-shrink: 0;
-        width: 18px;
-        height: 18px;
-        display: grid;
-        place-items: center;
-        border-radius: 50%;
-        font-size: 10px;
-        font-weight: 700;
-        background: rgba(251, 191, 36, .15);
-        color: #fbbf24;
+    .num {
+        text-align: right;
+        width: 100%;
     }
 
-    .issues li.block .dot {
-        background: rgba(255, 155, 155, .15);
-        color: #ff9b9b;
-    }
-
-    .row {
+    .foot {
         display: flex;
         justify-content: flex-end;
-        gap: 8px;
-        margin-top: 4px;
     }
 
-    button {
-        padding: 8px 14px;
-        border-radius: 8px;
-        border: 1px solid #2f6feb;
-        background: #2f6feb;
+    .save {
+        padding: 10px 20px;
+        border-radius: var(--radius);
+        border: 1px solid var(--accent);
+        background: var(--accent);
         color: #fff;
-        cursor: pointer;
         font-size: 14px;
+        cursor: pointer;
     }
 
-    button.ghost {
-        background: transparent;
-        border-color: #2a2f3a;
-        color: var(--text);
+    .save:disabled {
+        opacity: .5;
+        cursor: default;
     }
 
     kbd {
@@ -168,5 +543,128 @@
         padding: 0 4px;
         font-size: 11px;
         margin-left: 6px;
+    }
+
+    /* panels */
+    h3 {
+        font-size: 13px;
+        margin: 8px 0;
+        color: var(--text);
+    }
+
+    .muted {
+        color: var(--text-muted);
+        font-size: 13px;
+    }
+
+    .ahead, .arow {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 10px;
+        font-size: 13px;
+        padding: 5px 0;
+    }
+
+    .ahead {
+        color: var(--text-muted);
+        font-size: 11px;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .rt {
+        text-align: right;
+    }
+
+    .hot {
+        color: var(--ok);
+        font-weight: 600;
+    }
+
+    .sumline {
+        display: flex;
+        justify-content: space-between;
+        font-size: 13px;
+        margin-top: 8px;
+    }
+
+    .adv {
+        color: var(--warn);
+    }
+
+    .sidehead {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+    }
+
+    .refresh {
+        background: transparent;
+        border: 1px solid var(--border-hi);
+        color: var(--text-muted);
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+        cursor: pointer;
+    }
+
+    .hlist {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .hrow-btn {
+        position: relative;
+        width: 100%;
+        text-align: left;
+        background: var(--bg-app);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 8px 10px;
+        cursor: pointer;
+        color: var(--text);
+    }
+
+    li.active .hrow-btn {
+        border-color: var(--accent);
+    }
+
+    li.cancelled .hrow-btn {
+        opacity: .55;
+    }
+
+    .hline1 {
+        display: flex;
+        justify-content: space-between;
+        font-size: 13px;
+        font-weight: 600;
+    }
+
+    .htot {
+        color: var(--ok);
+    }
+
+    .hline2 {
+        display: flex;
+        justify-content: space-between;
+        font-size: 11px;
+        color: var(--text-muted);
+        margin-top: 2px;
+    }
+
+    .badge {
+        position: absolute;
+        top: 6px;
+        right: 8px;
+        font-size: 9px;
+        text-transform: uppercase;
+        color: #ff9b9b;
+        background: var(--danger-soft);
+        padding: 1px 5px;
+        border-radius: 4px;
     }
 </style>
