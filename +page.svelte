@@ -1,73 +1,449 @@
 <script lang="ts">
-    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
-    import { enterFlow } from "$lib/flow";
+    import {enterFlow} from "$lib/flow";
     import {auth} from "$lib/stores/auth.svelte";
     import {goto} from "$app/navigation";
     import {onMount} from "svelte";
     import {request, type Suggestion} from "$lib/api";
     import SmartLookup from "$lib/components/SmartLookup.svelte";
-    import LedgerLookup from "$lib/components/LedgerLookup.svelte";
     import PartyCreateDialog from "$lib/components/PartyCreateDialog.svelte";
+    import ItemCreateDialog from "$lib/components/ItemCreateDialog.svelte";
+    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
+    import LedgerLookup from "$lib/components/LedgerLookup.svelte";
     import {registerScreen} from "$lib/shell/useScreen.svelte";
 
     onMount(() => {
         if (!auth.isAuthed) return void goto("/login");
         if (auth.needsSetup) return void goto("/setup");
         if (auth.needsFy) return void goto("/fy");
-        void loadModes();
         void loadHistory();
+        void loadLedgers();
+        void loadModes();
+        if (charges.length === 0) charges = [newCharge()];   // default row for the enter-flow
+        focusParty();
     });
 
-    type Kind = "PAYMENT" | "RECEIVED";
-    type Allocation = {
-        id: number; bill_type: string; bill_id: number; bill_number: string | null;
-        bill_date: string | null; bill_total: number | null; amount: number;
+    type Mapping = { id: number; item: number; item_name: string; company: number; rate: number; stock: number; };
+    // A charge ledger straight from /api/ledgers/. `name` and `kind` drive the UI.
+    type Ledger = {
+        id: number; company: number | null; name: string;
+        kind: "DISCOUNT" | "ROUND_OFF" | "TAX" | "OTHER"; is_system: boolean; gst_rate: number | null;
     };
-    type SettleResult = { id: number; number: string; amount: number; allocations: Allocation[]; };
-    type Voucher = {
-        id: number; party: number; party_name: string; number: string;
-        date: string; amount: number; is_cancelled: boolean;
+    // Read-back charge row from a saved voucher.
+    type SavedCharge = {
+        id: number; ledger: number; ledger_name: string; charge_type: string;
+        mode: string; input_value: number; amount: number; sort_order: number;
     };
-    type OpenBill = {
-        bill_type: string; bill_id: number; number: string;
-        date: string; total: number; settled: number; open: number;
+    // A charge row being edited in the form. Its label/kind come from the picked ledger.
+    type ChargeRow = {
+        key: number; ledgerId: number | null; mode: "PERCENT" | "AMOUNT"; value: string;
     };
-    type OpenBills = { outstanding_total: number; bills: OpenBill[] };
-    type SettlementMode = {
-        id: number; name: string; is_system: boolean; is_active: boolean; sort_order: number;
+    type Line = {
+        key: number; item: Suggestion | null; company: number | null;
+        qty: string; rate: string; amount: string; resolving: boolean; note: string;
     };
+    type SaleLine = {
+        id: number; item: number; item_name: string; mapping: number;
+        company_resolved: number; company_name: string; derived: number | null;
+        qty: number; rate: number; amount: number;
+    };
+    type Derived = {
+        id: number; company: number; number: string; date: string;
+        total_amount: number; master: number; is_cancelled: boolean; lines: SaleLine[];
+    };
+    type Sale = {
+        id: number; company: number; party: number; party_name: string;
+        number: string; date: string; segregate: boolean; total_amount: number;
+        is_cancelled: boolean; lines: SaleLine[]; derived: Derived[]; charges: SavedCharge[];
+    };
+    // User-level settlement mode (Cash/UPI/…) for the optional inline settlement.
+    type SettlementMode = { id: number; name: string; is_system: boolean; is_active: boolean; sort_order: number; };
+
+    let seq = 0;
+    let chargeSeq = 0;
+    const newLine = (): Line => ({
+        key: ++seq, item: null, company: null, qty: "1", rate: "0", amount: "0.00", resolving: false, note: "",
+    });
+    const newCharge = (ledgerId: number | null = null): ChargeRow => ({
+        key: ++chargeSeq, ledgerId, mode: "PERCENT", value: "0",
+    });
 
     const today = new Date().toISOString().slice(0, 10);
-    let kind = $state<Kind>("PAYMENT");
     let party = $state<Suggestion | null>(null);
     let date = $state(today);
-    let amount = $state("0");
+    let segregate = $state(false);
+    let lines = $state<Line[]>([newLine()]);
     let saving = $state(false);
     let error = $state<string | null>(null);
-    let result = $state<SettleResult | null>(null);
-    let history = $state<Voucher[]>([]);
+    let saved = $state<Sale | null>(null);
+    let history = $state<Sale[]>([]);
     let loadingHistory = $state(false);
-    let selectedId = $state<number | null>(null);
-    let preview = $state<OpenBills | null>(null);
-    let loadingPreview = $state(false);
+    let editingId = $state<number | null>(null);
     let partyDialog = $state<string | null>(null);
+    let itemDialog = $state<{ text: string; lineKey: number } | null>(null);
+
+    // ── optional inline settlement (creates a RECEIVED against THIS sale) ──────
     let modes = $state<SettlementMode[]>([]);
-    let modeId = $state<number | null>(null);
+    let settleAmount = $state("0");
+    let settleModeId = $state<number | null>(null);
+    let settleNote = $state<string | null>(null);
+
+    // ── charges: ledger catalogue + dynamic charge rows ───────────────────────
+    let ledgers = $state<Ledger[]>([]);
+    let charges = $state<ChargeRow[]>([]);
+    let lastLedgerCompany = $state<number | null>(null);
+
+    // ── enter-flow / confirm state ────────────────────────────────────────────
+    let confirmOpen = $state(false);
+    let partyLookup = $state<{ focus: () => void } | null>(null);
 
     const companyId = $derived(auth.currentCompany?.id ?? null);
-    const endpoint = $derived(kind === "PAYMENT" ? "/api/vouchers/payments/" : "/api/vouchers/received/");
-    const canSave = $derived(!!party && !!companyId && Number(amount) > 0 && !saving);
-    const allocated = $derived((result?.allocations ?? []).reduce((s, a) => s + (Number(a.amount) || 0), 0));
-    const unallocated = $derived(result ? Math.max(0, (Number(result.amount) || 0) - allocated) : 0);
-    const modeOptions = $derived(modes.filter((m) => m.is_active).map((m) => ({ id: m.id, name: m.name })));
+    const isMulti = $derived(auth.mode === "multi");
+    const total = $derived(lines.reduce((s, l) => s + (Number(l.amount) || 0), 0));
+    const canSave = $derived(!!party && !!companyId && lines.some((l) => l.item && Number(l.qty) > 0) && !saving);
+    const round2 = (n: number) => (Math.round(n * 100) / 100).toFixed(2);
 
-    let confirmOpen = $state(false);
+    // Charge ledgers we render in v1: discount + round-off only (TAX/OTHER = v2).
+    const chargeLedgers = $derived(ledgers);
+    const ledgerById = $derived(new Map(ledgers.map((l) => [l.id, l])));
 
-    // Party, positive amount, and a date are the potential fields.
-    function isComplete(): boolean {
-        return !!party && !!companyId && Number(amount) > 0 && !!date;
+    // Inline-settlement helpers (independent of the charge ledgers above).
+    const modeOptions = $derived(modes.filter((m) => m.is_active).map((m) => ({id: m.id, name: m.name})));
+    const settleModeName = $derived(modes.find((m) => m.id === settleModeId)?.name ?? null);
+
+    // Options for a given charge row: all charge ledgers minus those already
+    // chosen in OTHER rows (keep this row's own pick so it still displays).
+    function optionsFor(row: ChargeRow) {
+        const usedElsewhere = new Set(
+            charges.filter((c) => c.key !== row.key && c.ledgerId != null).map((c) => c.ledgerId)
+        );
+        return chargeLedgers.filter((l) => l.id === row.ledgerId || !usedElsewhere.has(l.id));
     }
 
+    // True when every available charge ledger is already used across rows.
+    const allChargesUsed = $derived.by(() => {
+        const used = new Set(charges.filter((c) => c.ledgerId != null).map((c) => c.ledgerId));
+        return chargeLedgers.length > 0 && chargeLedgers.every((l) => used.has(l.id));
+    });
+
+    function focusSave() {
+        setTimeout(() => document.querySelector<HTMLElement>('[data-flow="save"]')?.focus(), 0);
+    }
+
+
+    function kindOf(row: ChargeRow): Ledger["kind"] | null {
+        return row.ledgerId != null ? (ledgerById.get(row.ledgerId)?.kind ?? null) : null;
+    }
+
+    // ── client-side PREVIEW only (server signs & rounds authoritatively) ───────
+    // Discounts first (on subtotal), then a single round-off delta on the result.
+    const discountPreview = $derived.by(() => {
+        let d = 0;
+        for (const c of charges) {
+            if (kindOf(c) !== "DISCOUNT") continue;
+            const v = Number(c.value) || 0;
+            if (v <= 0) continue;
+            d += c.mode === "PERCENT" ? (total * v) / 100 : v;
+        }
+        return d;
+    });
+    const afterDiscount = $derived(total - discountPreview);
+    const hasRoundOff = $derived(charges.some((c) => kindOf(c) === "ROUND_OFF"));
+    const roundDelta = $derived(hasRoundOff ? Math.round(afterDiscount) - afterDiscount : 0);
+    const finalBill = $derived(afterDiscount + roundDelta);
+
+    function onQtyOrRate(l: Line) {
+        l.amount = round2((Number(l.qty) || 0) * (Number(l.rate) || 0));
+    }
+
+    function onAmount(l: Line) {
+        const q = Number(l.qty) || 0;
+        l.rate = q > 0 ? round2((Number(l.amount) || 0) / q) : "0";
+    }
+
+    async function loadLedgers() {
+        if (companyId == null) return;
+        try {
+            const p = new URLSearchParams({company: String(companyId)});
+            const rows = await request<Ledger[] | { results?: Ledger[] }>(`/api/ledgers/?${p.toString()}`);
+            ledgers = Array.isArray(rows) ? rows : (rows?.results ?? []);
+            lastLedgerCompany = companyId;
+        } catch {
+            ledgers = [];
+        }
+    }
+
+    // User-level settlement modes for the inline settlement picker.
+    async function loadModes() {
+        try {
+            const rows = await request<SettlementMode[] | { results?: SettlementMode[] }>(
+                "/api/accounts/settlement-modes/"
+            );
+            modes = Array.isArray(rows) ? rows : (rows?.results ?? []);
+            if (settleModeId == null) {
+                const active = modes.filter((m) => m.is_active);
+                const sys = active.find((m) => m.is_system);
+                settleModeId = sys?.id ?? active[0]?.id ?? null;
+            }
+        } catch {
+            modes = [];
+        }
+    }
+
+    // Re-fetch ledgers when the active company changes (scoped shared + own).
+    $effect(() => {
+        if (companyId != null && companyId !== lastLedgerCompany) void loadLedgers();
+    });
+
+    async function loadHistory() {
+        if (!companyId) return;
+        loadingHistory = true;
+        try {
+            const p = new URLSearchParams({company: String(companyId)});
+            const rows = await request<Sale[] | { results?: Sale[] }>(`/api/vouchers/sales/?${p.toString()}`);
+            history = Array.isArray(rows) ? rows : (rows?.results ?? []);
+        } catch {
+            history = [];
+        } finally {
+            loadingHistory = false;
+        }
+    }
+
+    async function openForEdit(row: Sale) {
+        if (row.is_cancelled) return;
+        error = null;
+        saved = null;
+        editingId = row.id;
+        party = {id: row.party, name: row.party_name};
+        date = row.date;
+        segregate = row.segregate;
+        lines = row.lines.map((sl) => ({
+            key: ++seq, item: {id: sl.item, name: sl.item_name}, company: sl.company_resolved,
+            qty: String(sl.qty), rate: String(sl.rate), amount: round2(Number(sl.qty) * Number(sl.rate)),
+            resolving: false, note: "",
+        }));
+        if (lines.length === 0) lines = [newLine()];
+        hydrateCharges(row.charges ?? []);
+    }
+
+    // Rebuild editable charge rows from saved charges, keyed on the ledger id.
+    function hydrateCharges(rows: SavedCharge[]) {
+        charges = rows.map((c) => ({
+            key: ++chargeSeq,
+            ledgerId: c.ledger,
+            mode: c.mode === "AMOUNT" ? "AMOUNT" : "PERCENT",
+            value: String(c.input_value ?? 0),
+        }));
+    }
+
+    function resetForm() {
+        editingId = null;
+        party = null;
+        date = today;
+        segregate = false;
+        lines = [newLine()];
+        charges = [newCharge()];
+        error = null;
+        saved = null;
+        focusParty();
+    }
+
+    function onPartySelect(s: Suggestion) {
+        party = s;
+    }
+
+    function onPartyCreate(t: string) {
+        partyDialog = t;
+    }
+
+    function onPartyCreated(p: Suggestion) {
+        party = p;
+        partyDialog = null;
+        setTimeout(() => (document.getElementById("date") as HTMLElement | null)?.focus(), 0);
+    }
+
+    async function resolveRate(line: Line, itemId: number) {
+        const rc = line.company ?? companyId;
+        if (!rc) return;
+        line.resolving = true;
+        line.note = "";
+        try {
+            const params = new URLSearchParams({item: String(itemId), company: String(rc)});
+            const rows = await request<Mapping[]>(`/api/catalogue/mappings/?${params.toString()}`);
+            const list = Array.isArray(rows) ? rows : ((rows as { results?: Mapping[] })?.results ?? []);
+            if (list.length > 0) {
+                line.rate = String(list[0].rate ?? line.rate ?? 0);
+                onQtyOrRate(line);
+            } else {
+                line.note = "No mapping yet — server uses the default company.";
+            }
+        } catch (e) {
+            line.note = e instanceof Error ? e.message : "Failed to resolve rate.";
+        } finally {
+            line.resolving = false;
+        }
+    }
+
+    function onItemSelect(line: Line, s: Suggestion) {
+        line.item = s;
+        void resolveRate(line, s.id);
+    }
+
+    function onItemCreate(line: Line, t: string) {
+        itemDialog = {text: t, lineKey: line.key};
+    }
+
+    function onItemCreated(i: Suggestion) {
+        const target = lines.find((l) => l.key === itemDialog?.lineKey);
+        const key = itemDialog?.lineKey;
+        itemDialog = null;
+        if (target) {
+            target.item = i;
+            void resolveRate(target, i.id);
+            if (key != null) focusRowQty(key);
+        }
+    }
+
+    function addLine() {
+        lines = [...lines, newLine()];
+    }
+
+    // Enter on the last line's amount: add a new line and focus it (keeps Alt+A too).
+    function onLineEnter(e: KeyboardEvent, line: Line) {
+        if (e.key !== "Enter" || e.ctrlKey || e.metaKey) return;
+        const isLast = lines[lines.length - 1]?.key === line.key;
+        if (!isLast) return;               // not last -> let normal flow advance
+        e.preventDefault();
+        e.stopPropagation();
+        addLine();
+        const created = lines[lines.length - 1];
+        setTimeout(() => {
+            const rows = Array.from(document.querySelectorAll<HTMLElement>(".grow"));
+            const idx = lines.findIndex((l) => l.key === created.key);
+            rows[idx]?.querySelector<HTMLInputElement>('[data-flow="item"]')?.focus();
+        }, 0);
+    }
+
+    function removeLine(key: number) {
+        lines = lines.length > 1 ? lines.filter((l) => l.key !== key) : lines;
+    }
+
+    // Enter on an empty item field of the last, blank line: drop it and advance.
+    function onLineEmptyEnter(line: Line) {
+        const isLast = lines[lines.length - 1]?.key === line.key;
+        const blank = !line.item && (line.qty === "" || Number(line.qty) === 0 || line.qty === "1") && Number(line.amount) === 0;
+        if (isLast && lines.length > 1 && blank) {
+            removeLine(line.key);
+        }
+        // Move focus to the first charge row's picker (next flow step).
+        setTimeout(() => document.querySelector<HTMLElement>('[data-flow="charge"]')?.focus(), 0);
+    }
+
+
+    // ── charge row management ─────────────────────────────────────────────────
+    function addCharge() {
+        // Default the picker to the first unused charge ledger, if any.
+        const used = new Set(charges.map((c) => c.ledgerId));
+        const first = chargeLedgers.find((l) => !used.has(l.id)) ?? chargeLedgers[0] ?? null;
+        charges = [...charges, newCharge(first?.id ?? null)];
+        setTimeout(() => {
+            const rows = document.querySelectorAll<HTMLElement>('[data-flow="charge"]');
+            rows[rows.length - 1]?.focus();
+        }, 0);
+    }
+
+    // Enter on the last charge's value: chain a new charge. Never let it reach
+    // the flow root (which would also open the confirm dialog).
+    function onChargeEnter(e: KeyboardEvent, charge: ChargeRow) {
+        if (e.key !== "Enter" || e.ctrlKey || e.metaKey) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();        // hard stop: no flow-root, no dialog
+        const isLast = charges[charges.length - 1]?.key === charge.key;
+        if (isLast) {
+            if (allChargesUsed) focusSave();   // nothing left to add -> go to Save
+            else addCharge();
+        } else {
+            // advance to the next charge row's picker manually
+            const idx = charges.findIndex((c) => c.key === charge.key);
+            const nextKey = charges[idx + 1]?.key;
+            setTimeout(() => {
+                const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-flow="charge"]'));
+                rows[idx + 1]?.focus();
+            }, 0);
+        }
+    }
+
+    // Enter after picking a ledger. For ROUND_OFF (no value field) chain/advance;
+    // for DISCOUNT, move focus into its value input instead.
+    function onChargePicked(charge: ChargeRow) {
+        const kind = kindOf(charge);
+        if (kind === "DISCOUNT") {
+            setTimeout(() => {
+                const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-flow="charge"]'));
+                const idx = charges.findIndex((c) => c.key === charge.key);
+                const row = rows[idx]?.closest(".chrow");
+                row?.querySelector<HTMLInputElement>('[data-flow="charge-val"]')?.focus();
+            }, 0);
+            return;
+        }
+        // No-value kind (ROUND_OFF / CGST / SGST): chain if ledgers remain, else Save.
+        const isLast = charges[charges.length - 1]?.key === charge.key;
+        if (isLast && !allChargesUsed) addCharge();
+        else focusSave();
+    }
+
+
+    function removeCharge(key: number) {
+        charges = charges.filter((c) => c.key !== key);
+    }
+
+    // Enter on an empty charge picker of the last, blank charge: drop it and advance to Save.
+    function onChargeEmptyEnter(charge: ChargeRow) {
+        const isLast = charges[charges.length - 1]?.key === charge.key;
+        if (isLast && charge.ledgerId == null) {
+            if (charges.length > 1) removeCharge(charge.key);
+            else charges = [];   // collapse the lone default row so flow reaches Save
+        }
+        setTimeout(() => document.querySelector<HTMLElement>('[data-flow="save"]')?.focus(), 0);
+    }
+
+
+    function focusCharges() {
+        if (charges.length === 0) addCharge();
+        else setTimeout(() => document.querySelector<HTMLElement>('[data-flow="charge"]')?.focus(), 0);
+    }
+
+    function focusParty() {
+        setTimeout(() => partyLookup?.focus(), 0);
+    }
+
+    function focusRowQty(key: number) {
+        setTimeout(() => {
+            const rows = Array.from(document.querySelectorAll<HTMLElement>(".grow"));
+            const idx = lines.findIndex((l) => l.key === key);
+            const el = rows[idx]?.querySelector<HTMLInputElement>('[data-flow="qty"]');
+            el?.focus();
+            el?.select();
+        }, 0);
+    }
+
+    function isComplete(): boolean {
+        if (!party || !companyId) return false;
+        return lines.every((l) => !l.item || Number(l.qty) > 0);
+    }
+
+    const flowOpts = $derived({
+        // Ctrl+Enter on a complete form: save directly, no dialog.
+        onSave: (_opts: { direct: boolean }) => {
+            if (canSave) void save();
+        },
+        isComplete,
+        // Plain Enter at the end always opens the confirm dialog.
+        onConfirm: () => {
+            confirmOpen = true;
+        },
+    });
+
+    // ── save via confirmation ─────────────────────────────────────────────────
     function requestSave() {
         if (!canSave) return;
         confirmOpen = true;
@@ -80,299 +456,332 @@
 
     function closeConfirm() {
         confirmOpen = false;
-        // return focus into the flow so shortcuts keep working
-        setTimeout(() => (document.getElementById("amount") as HTMLElement | null)?.focus(), 0);
+        focusParty();          // return focus into the flow so shortcuts keep working
     }
 
 
-    const flowOpts = $derived({
-        // Ctrl+Enter on a complete form: save directly, no dialog.
-        onSave: (_opts: { direct: boolean }) => { if (canSave) void save(); },
-        isComplete,
-        // Plain Enter at the end always opens the confirm dialog.
-        onConfirm: () => { confirmOpen = true; },
-    });
-
-    // Live preview: how much of `amount` will settle which open bills (oldest->latest).
-    const previewPlan = $derived.by(() => {
-        if (!preview) return [];
-        let remaining = Number(amount) || 0;
-        return preview.bills.map((b) => {
-            const take = Math.min(remaining, Number(b.open));
-            remaining = Math.max(0, remaining - take);
-            return {...b, willSettle: take};
-        });
-    });
-
-    function onPartySelect(s: Suggestion) {
-        party = s;
-        void loadHistory();
-        void loadPreview();
-    }
-
-    function onPartyCreate(t: string) {
-        partyDialog = t;
-    }
-
-    function onPartyCreated(p: Suggestion) {
-        party = p;
-        partyDialog = null;
-        void loadHistory();
-        void loadPreview();
-    }
-
-    function setKind(k: Kind) {
-        if (k === kind) return;
-        kind = k;
-        result = null;
-        error = null;
-        selectedId = null;
-        void loadHistory();
-        void loadPreview();
-    }
-
-    // User-level settlement modes (Cash/UPI/…). Loaded once; shared by both kinds.
-    async function loadModes() {
-        try {
-            const rows = await request<SettlementMode[] | { results?: SettlementMode[] }>(
-                "/api/accounts/settlement-modes/"
-            );
-            modes = Array.isArray(rows) ? rows : (rows?.results ?? []);
-            if (modeId == null) {
-                const active = modes.filter((m) => m.is_active);
-                const sys = active.find((m) => m.is_system);
-                modeId = sys?.id ?? active[0]?.id ?? null;
+    // Build the backend charge payload from the dynamic rows, driven by ledger kind.
+    function buildPayloadCharges() {
+        const out: Array<Record<string, unknown>> = [];
+        for (const c of charges) {
+            if (c.ledgerId == null) continue;
+            const kind = ledgerById.get(c.ledgerId)?.kind;
+            if (kind === "DISCOUNT") {
+                const v = Number(c.value) || 0;
+                if (v <= 0) continue;
+                out.push({ledger_id: c.ledgerId, charge_type: "DISCOUNT", mode: c.mode, input_value: v});
+            } else if (kind === "ROUND_OFF") {
+                out.push({ledger_id: c.ledgerId, charge_type: "ROUND_OFF"});
             }
-        } catch {
-            modes = [];
+            // TAX / OTHER: v2 — skipped in v1.
         }
-    }
-
-    function onModeSelect(id: number) {
-        modeId = id;
-    }
-
-    async function loadHistory() {
-        if (!companyId) return;
-        loadingHistory = true;
-        try {
-            const p = new URLSearchParams({company: String(companyId)});
-            if (party) p.set("party", String(party.id));
-            const rows = await request<Voucher[] | { results?: Voucher[] }>(`${endpoint}?${p.toString()}`);
-            history = Array.isArray(rows) ? rows : (rows?.results ?? []);
-        } catch {
-            history = [];
-        } finally {
-            loadingHistory = false;
-        }
-    }
-
-    // New backend contract: GET /api/vouchers/{payments|received}/open_bills/?party=
-    async function loadPreview() {
-        if (!party) {
-            preview = null;
-            return;
-        }
-        loadingPreview = true;
-        try {
-            const p = new URLSearchParams({party: String(party.id)});
-            preview = await request<OpenBills>(`${endpoint}open_bills/?${p.toString()}`);
-            shell.activeTab = "allocation";
-        } catch {
-            preview = null;
-        } finally {
-            loadingPreview = false;
-        }
-    }
-
-    async function viewVoucher(v: Voucher) {
-        selectedId = v.id;
-        error = null;
-        try {
-            const allocs = await request<Allocation[]>(`${endpoint}${v.id}/allocations/`);
-            result = {id: v.id, number: v.number, amount: Number(v.amount), allocations: allocs ?? []};
-            shell.activeTab = "allocation";
-        } catch (e) {
-            error = e instanceof Error ? e.message : "Could not load allocations.";
-        }
+        return out;
     }
 
     async function save() {
         if (!party || !companyId || saving) return;
         saving = true;
         error = null;
-        result = null;
-        selectedId = null;
+        saved = null;
+        settleNote = null;
         try {
-            const res = await request<SettleResult>(endpoint, {
-                method: "POST",
-                body: JSON.stringify({company: companyId, party: party.id, date, amount: Number(amount), mode: modeId, number: null}),
+            const payloadLines = lines.filter((l) => l.item && Number(l.qty) > 0).map((l) => {
+                const row: { item: number; qty: number; rate: number; company?: number } = {
+                    item: l.item!.id, qty: Number(l.qty), rate: Number(l.rate) || 0,
+                };
+                if (isMulti && l.company) row.company = l.company;
+                return row;
             });
-            result = {id: res.id, number: res.number, amount: Number(res.amount), allocations: res.allocations ?? []};
-            amount = "0";
+            if (payloadLines.length === 0) {
+                error = "Add at least one item with a quantity.";
+                return;
+            }
+            if (editingId != null) await request(`/api/vouchers/sales/${editingId}/cancel/`, {method: "POST"});
+            const res = await request<Sale>("/api/vouchers/sales/", {
+                method: "POST",
+                body: JSON.stringify({
+                    company: companyId, party: party.id, date, number: null,
+                    segregate: isMulti ? segregate : false, lines: payloadLines,
+                    charges: buildPayloadCharges(),
+                }),
+            });
+            saved = res;
+
+            // Optional inline settlement — a SEPARATE, independent write. The sale
+            // is already saved; a settlement failure never rolls it back. Targets
+            // this sale only (target_bill_id), so it won't touch the party's other bills.
+            const amt = Number(settleAmount) || 0;
+            if (amt > 0) {
+                try {
+                    await request("/api/vouchers/received/", {
+                        method: "POST",
+                        body: JSON.stringify({
+                            company: companyId, party: party.id, date,
+                            amount: amt, mode: settleModeId, number: null,
+                            target_bill_id: res.id,
+                        }),
+                    });
+                    settleNote = `Settled ${amt.toFixed(2)} against #${res.number}${settleModeName ? ` via ${settleModeName}` : ""}.`;
+                } catch (se) {
+                    settleNote = `Sale #${res.number} saved, but the settlement did not post${se instanceof Error ? `: ${se.message}` : ""}. You can settle it later from the Settle page.`;
+                }
+            }
+
+            editingId = null;
+            party = null;
+            segregate = false;
+            lines = [newLine()];
+            charges = [];
+            settleAmount = "0";
             await loadHistory();
-            await loadPreview();
-            shell.activeTab = "allocation";
+            focusParty();
         } catch (e) {
-            error = e instanceof Error ? e.message : "Could not save.";
+            error = e instanceof Error ? e.message : "Could not save sale.";
         } finally {
             saving = false;
         }
     }
 
+    function viewDerived(row: Sale) {
+        saved = row;
+        shell.activeTab = "derived";
+    }
+
     const shell = registerScreen(() => ({
-        title: "Settle",
+        title: "Sale",
         actions: [
-            {id: "set-save", label: "Save", icon: "✓", shortcut: "Ctrl+Enter", run: requestSave},
+            {id: "sal-new", label: "New", icon: "＋", shortcut: "Ctrl+N", run: resetForm},
+            {id: "sal-add", label: "Add line", icon: "▸", shortcut: "Alt+A", run: addLine},
+            {id: "sal-charge", label: "Add charge", icon: "%", shortcut: "Alt+I", run: addCharge},
+            {id: "sal-save", label: "Save", icon: "✓", shortcut: "Ctrl+Enter", run: requestSave},
         ],
         shortcuts: [
-
+            {id: "sal-k-new", keychord: "ctrl+n", label: "New", run: resetForm},
+            {id: "sal-k-add", keychord: "alt+a", label: "Add line", run: addLine},
+            {id: "sal-k-charge", keychord: "alt+i", label: "Add charge", run: addCharge},
+            {id: "sal-k-focus-charge", keychord: "alt+g", label: "Focus charges", run: focusCharges},
         ],
         panel: [
-            {id: "allocation", title: "Allocation", body: allocationPanel},
             {id: "history", title: "History", body: historyPanel},
+            {id: "derived", title: "Derived", body: derivedPanel},
         ],
     }));
 </script>
 
-{#snippet allocationPanel()}
-    {#if result}
-        <div class="banner ok">#{result.number} · {result.amount.toFixed(2)}</div>
-        <h3>Settled</h3>
-        {#if result.allocations.length === 0}
-            <p class="muted">No open bills settled. Kept on account.</p>
-        {:else}
-            {#each result.allocations as a (a.id)}
-                <div class="arow"><span>#{a.bill_number ?? a.bill_id}</span>
-                    <span class="rt">{Number(a.amount).toFixed(2)}</span></div>
-            {/each}
-            <div class="sumline"><span>Allocated</span><strong>{allocated.toFixed(2)}</strong></div>
-            {#if unallocated > 0}<div class="sumline adv"><span>On account</span><strong>{unallocated.toFixed(2)}</strong></div>{/if}
-        {/if}
-    {:else if !party}
-        <p class="muted">Pick a party to preview open {kind === "PAYMENT" ? "purchases" : "sales"}.</p>
-    {:else if loadingPreview}
-        <p class="muted">Loading open bills…</p>
-    {:else if preview}
-        <h3>Open bills · outstanding {Number(preview.outstanding_total).toFixed(2)}</h3>
-        {#if preview.bills.length === 0}
-            <p class="muted">Nothing outstanding.</p>
-        {:else}
-            <div class="ahead"><span>Bill</span><span class="rt">Open</span><span class="rt">Will settle</span></div>
-            {#each previewPlan as b (b.bill_id)}
-                <div class="arow"><span>#{b.number}</span>
-                    <span class="rt">{Number(b.open).toFixed(2)}</span>
-                    <span class="rt" class:hot={b.willSettle > 0}>{b.willSettle.toFixed(2)}</span></div>
-            {/each}
-        {/if}
-    {/if}
-{/snippet}
-
 {#snippet historyPanel()}
     <div class="sidehead">
-        <span class="muted">{kind === "PAYMENT" ? "Payments" : "Receipts"}{party ? ` · ${party.name}` : ""}</span>
+        <span class="muted">Recent sales</span>
         <button class="refresh" onclick={loadHistory} disabled={loadingHistory}>{loadingHistory ? "…" : "↻"}</button>
     </div>
     {#if history.length === 0}
-        <p class="muted">{loadingHistory ? "Loading…" : "No records."}</p>
+        <p class="muted">{loadingHistory ? "Loading…" : "No sales yet."}</p>
     {:else}
         <ul class="hlist">
-            {#each history as v (v.id)}
-                <li class:cancelled={v.is_cancelled} class:active={v.id === selectedId}>
-                    <button class="hrow-btn" onclick={() => viewVoucher(v)}>
-                        <div class="hline1"><span>#{v.number}</span><span class="htot">{Number(v.amount).toFixed(2)}</span></div>
-                        <div class="hline2"><span>{v.party_name}</span><span>{v.date}</span></div>
-                        {#if v.is_cancelled}<span class="badge">cancelled</span>{/if}
-                    </button>
+            {#each history as h (h.id)}
+                <li class:cancelled={h.is_cancelled} class:active={h.id === editingId}>
+                    <div class="hrow">
+                        <button class="hmain" disabled={h.is_cancelled} onclick={() => openForEdit(h)}>
+                            <div class="hline1"><span>#{h.number}</span><span
+                                    class="htot">{Number(h.total_amount).toFixed(2)}</span></div>
+                            <div class="hline2"><span>{h.party_name}</span><span>{h.date}</span></div>
+                        </button>
+                        <button class="viewbtn" title="View derived" onclick={() => viewDerived(h)}>▣</button>
+                        {#if h.is_cancelled}<span class="badge">cancelled</span>{/if}
+                    </div>
                 </li>
             {/each}
         </ul>
     {/if}
 {/snippet}
 
-<div class="wrap" use:enterFlow={flowOpts}>
-    <div class="toggle">
-        <button class:active={kind === "PAYMENT"} onclick={() => setKind("PAYMENT")}>Payment</button>
-        <button class:active={kind === "RECEIVED"} onclick={() => setKind("RECEIVED")}>Received</button>
-    </div>
-    <p class="sub">{kind === "PAYMENT"
-        ? "Pay a vendor. Auto-settles open purchases oldest → latest."
-        : "Receive from a customer. Auto-settles open sales oldest → latest."}</p>
+{#snippet derivedPanel()}
+    {#if !saved}
+        <p class="muted">Save a sale or pick one from History to see its company-sales.</p>
+    {:else}
+        <div class="sidehead"><span class="muted">Master #{saved.number}
+            · {Number(saved.total_amount).toFixed(2)}</span></div>
+        {#if saved.derived.length === 0}
+            <p class="muted">No derived sales.</p>
+        {:else}
+            {#each saved.derived as d (d.id)}
+                <div class="derived">
+                    <div class="dhead"><span>#{d.number}</span><span
+                            class="dtot">{Number(d.total_amount).toFixed(2)}</span></div>
+                    <div class="dlines">
+                        {#each d.lines as dl (dl.id)}
+                            <div class="dline"><span>{dl.item_name}</span>
+                                <span class="rt">{Number(dl.qty)}×{Number(dl.rate).toFixed(2)}</span>
+                                <span class="rt">{Number(dl.amount).toFixed(2)}</span></div>
+                        {/each}
+                    </div>
+                </div>
+            {/each}
+        {/if}
+    {/if}
+{/snippet}
 
-    {#if error}<div class="banner err">{error}</div>{/if}
+<div class="wrap" use:enterFlow={flowOpts}>
+    {#if editingId != null}
+        <div class="banner edit">Editing — saving will <strong>cancel the original</strong> and replace it.
+            <button class="linkbtn" onclick={resetForm}>Discard</button>
+        </div>
+    {/if}
+    {#if saved}
+        <div class="banner ok">Saved sale <strong>#{saved.number}</strong> · total
+            <strong>{Number(saved.total_amount).toFixed(2)}</strong>. See <strong>Derived</strong> panel.
+        </div>
+    {/if}
+    {#if error}
+        <div class="banner err">{error}</div>
+    {/if}
 
     <section class="head">
         <div class="field">
             <label for="party">Party</label>
             <SmartLookup type="PARTY" flow="party" placeholder="Search or create party…" value={party}
+                         bind:this={partyLookup}
                          onselect={onPartySelect} oncreate={onPartyCreate}/>
-        </div>
-        <div class="field amt">
-            <label for="amount">Amount</label>
-            <input id="amount" class="num" type="number" min="0" step="0.01" data-flow="amount" bind:value={amount}/>
-        </div>
-        <div class="field mode">
-            <label for="mode">Mode</label>
-            <LedgerLookup options={modeOptions} bind:value={modeId} placeholder="Settlement mode…"
-                          onselect={onModeSelect}/>
         </div>
         <div class="field date">
             <label for="date">Date</label>
             <input id="date" type="date" data-flow="date" bind:value={date}/>
         </div>
+        {#if isMulti}
+            <label class="seg"><input type="checkbox" bind:checked={segregate}/> Segregate</label>
+        {/if}
+    </section>
+
+    <section class="grid">
+        <div class="ghead"><span>Item</span><span>Qty</span><span>Rate</span><span>Amount</span><span></span></div>
+        {#each lines as line (line.key)}
+            <div class="grow">
+                <div class="cell item">
+                    <SmartLookup type="ITEM" flow="item"
+                                 placeholder="Search or create item ..."
+                                 value={line.item}
+                                 onselect={(s) => onItemSelect(line, s)}
+                                 oncreate={(t) => onItemCreate(line, t)}
+                                 onemptyenter={() => onLineEmptyEnter(line)}
+                    />
+                    {#if line.resolving}<span class="hint">Resolving rate…</span>
+                    {:else if line.note}<span class="hint warn">{line.note}</span>{/if}
+                </div>
+                <div class="qtycell">
+                    <input class="num" type="number" min="0" step="0.001" data-flow="qty"
+                           bind:value={line.qty} oninput={() => onQtyOrRate(line)}/>
+                    {#if line.item?.base_unit}<span class="unit">{line.item.base_unit}</span>{/if}
+                </div>
+                <input class="num" type="number" min="0" step="0.01" data-flow="rate"
+                       bind:value={line.rate} oninput={() => onQtyOrRate(line)}/>
+                <input class="num" type="number" min="0" step="0.01" data-flow="amount"
+                       bind:value={line.amount} oninput={() => onAmount(line)} onkeydown={(e) => onLineEnter(e, line)}/>
+                <button class="del" title="Remove line" onclick={() => removeLine(line.key)}>✕</button>
+            </div>
+        {/each}
+        <button class="addline" onclick={addLine}>+ Add line <kbd>Alt A</kbd></button>
+    </section>
+
+    <section class="charges">
+        <div class="chhead"><span>Charges</span></div>
+        {#each charges as c (c.key)}
+            {@const kind = kindOf(c)}
+            <div class="chrow">
+                <LedgerLookup flow="charge"
+                              options={optionsFor(c)}
+                              value={c.ledgerId}
+                              onselect={(id) => (c.ledgerId = id)}
+                              onenter={() => onChargePicked(c)}
+                              onemptyenter={() => onChargeEmptyEnter(c)}
+                />
+
+
+                {#if kind === "DISCOUNT"}
+                    <div class="chmode">
+                        <button type="button" class:active={c.mode === "PERCENT"}
+                                onclick={() => (c.mode = "PERCENT")}>%
+                        </button>
+                        <button type="button" class:active={c.mode === "AMOUNT"}
+                                onclick={() => (c.mode = "AMOUNT")}>₹
+                        </button>
+                    </div>
+                    <input class="num" type="number" min="0" step="0.01" data-flow="charge-val"
+                           bind:value={c.value}
+                           placeholder={c.mode === "PERCENT" ? "0 %" : "0.00"}
+                           onkeydown={(e) => onChargeEnter(e, c)}
+                    />
+                {:else if kind === "ROUND_OFF"}
+                    <span class="chspan">auto</span>
+                    <span class="chhint">server computes the delta</span>
+                {:else}
+                    <span class="chspan"></span><span></span>
+                {/if}
+
+                <button class="del" title="Remove charge" onclick={() => removeCharge(c.key)}>✕</button>
+            </div>
+        {/each}
+        <button class="addline" onclick={addCharge}
+                disabled={chargeLedgers.length === 0}>+ Add charge <kbd>Alt I</kbd></button>
+    </section>
+
+    <section class="totals">
+        <div class="trow"><span>Line-item total</span><span>{total.toFixed(2)}</span></div>
+        {#if discountPreview > 0}
+            <div class="trow discount"><span>Discount</span><span>− {discountPreview.toFixed(2)}</span></div>
+        {/if}
+        {#if hasRoundOff && roundDelta !== 0}
+            <div class="trow round"><span>Round off</span>
+                <span>{roundDelta >= 0 ? "+" : "−"} {Math.abs(roundDelta).toFixed(2)}</span></div>
+        {/if}
+        <div class="trow final"><span>Final bill</span><strong>{finalBill.toFixed(2)}</strong></div>
     </section>
 
     <footer class="foot">
         <button class="save" type="button" data-flow="save" disabled={!canSave} onclick={requestSave}>
-            {saving ? "Saving…" : `Save ${kind === "PAYMENT" ? "payment" : "receipt"}`} <kbd>Ctrl ⏎</kbd>
+            {saving ? "Saving…" : (editingId != null ? "Save changes" : "Save sale")} <kbd>Ctrl ⏎</kbd>
         </button>
     </footer>
+
+    <section class="settle-inline">
+        <div class="chhead"><span>Settlement (optional)</span></div>
+        <div class="settle-row">
+            <div class="field amt">
+                <label for="settle-amount">Amount</label>
+                <input id="settle-amount" class="num" type="number" min="0" step="0.01"
+                       bind:value={settleAmount} placeholder="0.00"/>
+            </div>
+            <div class="field mode">
+                <label for="settle-mode">Mode</label>
+                <LedgerLookup options={modeOptions} bind:value={settleModeId}
+                              placeholder="Settlement mode…" onselect={(id) => (settleModeId = id)}/>
+            </div>
+        </div>
+        <p class="settle-hint">Leave amount at 0 to save the sale without settling. Any amount here settles this sale only.</p>
+        {#if settleNote}<div class="settle-note">{settleNote}</div>{/if}
+    </section>
 </div>
 
+
 {#if partyDialog !== null}
-    <PartyCreateDialog initialName={partyDialog} oncreated={onPartyCreated} oncancel={() => (partyDialog = null)}/>{/if}
+    <PartyCreateDialog initialName={partyDialog} oncreated={onPartyCreated} oncancel={() => (partyDialog = null)}/>
+{/if}
+{#if itemDialog !== null && companyId}
+    <ItemCreateDialog initialName={itemDialog.text} companyId={companyId} oncreated={onItemCreated}
+                      oncancel={() => (itemDialog = null)}/>
+{/if}
 {#if confirmOpen}
     <ConfirmDialog
-        title={kind === "PAYMENT" ? "Confirm payment" : "Confirm receipt"}
-        message={`Party: ${party?.name ?? "—"} · Amount ${Number(amount).toFixed(2)}. Auto-settle oldest → latest?`}
-        confirmLabel={kind === "PAYMENT" ? "Post payment" : "Post receipt"}
-        busy={saving}
-        onconfirm={confirmSave}
-        oncancel={closeConfirm}/>{/if}
+            title={editingId != null ? "Replace this sale?" : "Confirm sale"}
+            message={`Party: ${party?.name ?? "—"} · Final bill ${finalBill.toFixed(2)}. ${editingId != null ? "The original will be cancelled and replaced." : "Post this voucher?"}${Number(settleAmount) > 0 ? ` Then settle ${Number(settleAmount).toFixed(2)}${settleModeName ? ` via ${settleModeName}` : ""} against it.` : ""}`}
+            confirmLabel={editingId != null ? "Replace" : "Post sale"}
+            busy={saving}
+            onconfirm={confirmSave}
+            oncancel={closeConfirm}/>
+{/if}
 
 <style>
     .wrap {
         padding: 20px 28px 40px;
         box-sizing: border-box;
-        max-width: 760px;
-    }
-
-    .toggle {
-        display: inline-flex;
-        border: 1px solid var(--border-hi);
-        border-radius: var(--radius);
-        overflow: hidden;
-        margin-bottom: 8px;
-    }
-
-    .toggle button {
-        padding: 8px 18px;
-        background: transparent;
-        border: none;
-        color: var(--text-muted);
-        cursor: pointer;
-        font-size: 14px;
-    }
-
-    .toggle button.active {
-        background: var(--accent);
-        color: #fff;
-    }
-
-    .sub {
-        color: var(--text-muted);
-        font-size: 13px;
-        margin: 0 0 18px;
     }
 
     .banner {
@@ -394,10 +803,21 @@
         border: 1px solid var(--danger-border);
     }
 
+    .banner.edit {
+        background: #1d2233;
+        color: #b9c6ff;
+        border: 1px solid #34406b;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+    }
+
     .head {
         display: flex;
         gap: 18px;
-        margin-bottom: 20px;
+        align-items: flex-end;
+        margin-bottom: 22px;
+        max-width: 720px;
     }
 
     .field {
@@ -407,16 +827,18 @@
         gap: 6px;
     }
 
-    .field.amt {
-        max-width: 200px;
-    }
-
-    .field.mode {
-        max-width: 200px;
-    }
-
     .field.date {
         max-width: 180px;
+    }
+
+    .seg {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--text);
+        padding-bottom: 8px;
+        white-space: nowrap;
     }
 
     label {
@@ -424,24 +846,234 @@
         color: var(--text-muted);
     }
 
-    .num, input[type="date"] {
+    input[type="date"] {
         padding: 8px 10px;
         border-radius: var(--radius);
         border: 1px solid var(--border-hi);
         background: var(--bg-app);
         color: var(--text);
         font-size: 14px;
-        box-sizing: border-box;
+    }
+
+    .grid {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--bg-panel);
+    }
+
+    .ghead, .grow {
+        display: grid;
+        grid-template-columns: 1fr 130px 110px 120px 40px;
+        gap: 12px;
+        align-items: start;
+        padding: 12px 14px;
+    }
+
+    .ghead {
+        color: var(--text-muted);
+        font-size: 12px;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .grow {
+        border-bottom: 1px solid #171b23;
+    }
+
+    .cell.item {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .hint {
+        font-size: 11px;
+        color: var(--text-muted);
+    }
+
+    .hint.warn {
+        color: var(--warn);
+    }
+
+    .linkbtn {
+        background: transparent;
+        border: 1px solid var(--accent);
+        color: var(--accent-text);
+        padding: 2px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 11px;
+    }
+
+    .qtycell {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .qtycell .num {
+        flex: 1;
+    }
+
+    .unit {
+        font-size: 12px;
+        color: var(--text-muted);
     }
 
     .num {
+        padding: 8px 10px;
+        border-radius: var(--radius);
+        border: 1px solid var(--border-hi);
+        background: var(--bg-app);
+        color: var(--text);
+        font-size: 14px;
         text-align: right;
+        box-sizing: border-box;
         width: 100%;
+    }
+
+    .del {
+        align-self: center;
+        background: transparent;
+        border: none;
+        color: #6b7280;
+        cursor: pointer;
+    }
+
+    .del:hover {
+        color: var(--danger);
+    }
+
+    .addline {
+        width: 100%;
+        padding: 10px;
+        background: transparent;
+        border: none;
+        color: var(--accent-text);
+        cursor: pointer;
+        font-size: 14px;
+        text-align: left;
+    }
+
+    .addline:hover {
+        background: var(--accent-soft);
+    }
+
+    .addline:disabled {
+        opacity: .5;
+        cursor: default;
+    }
+
+    /* ── charges section ── */
+    .charges {
+        margin-top: 14px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--bg-elevated);
+        padding: 8px 14px 6px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-width: 560px;
+        margin-left: auto;
+    }
+
+    .chhead {
+        color: var(--text-muted);
+        font-size: 12px;
+        padding: 4px 0 2px;
+    }
+
+    .chrow {
+        display: grid;
+        grid-template-columns: 1fr auto 130px 32px;
+        gap: 10px;
+        align-items: center;
+    }
+
+    .chsel {
+        padding: 8px 10px;
+        border-radius: var(--radius);
+        border: 1px solid var(--border-hi);
+        background: var(--bg-app);
+        color: var(--text);
+        font-size: 13px;
+    }
+
+    .chmode {
+        display: inline-flex;
+        border: 1px solid var(--border-hi);
+        border-radius: 6px;
+        overflow: hidden;
+    }
+
+    .chmode button {
+        background: transparent;
+        border: none;
+        color: var(--text-muted);
+        padding: 6px 10px;
+        cursor: pointer;
+        font-size: 13px;
+    }
+
+    .chmode button.active {
+        background: var(--accent);
+        color: #fff;
+    }
+
+    .chspan {
+        font-size: 13px;
+        color: var(--text-muted);
+        text-align: right;
+    }
+
+    .chhint {
+        font-size: 11px;
+        color: var(--text-muted);
+    }
+
+    /* ── totals breakdown ── */
+    .totals {
+        margin-top: 14px;
+        max-width: 560px;
+        margin-left: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .trow {
+        display: flex;
+        justify-content: space-between;
+        font-size: 14px;
+        color: var(--text);
+        padding: 2px 2px;
+    }
+
+    .trow.discount {
+        color: var(--danger);
+    }
+
+    .trow.round {
+        color: var(--warn);
+    }
+
+    .trow.final {
+        border-top: 1px solid var(--border-hi);
+        padding-top: 8px;
+        margin-top: 4px;
+        font-size: 16px;
+    }
+
+    .trow.final strong {
+        color: var(--ok);
     }
 
     .foot {
         display: flex;
         justify-content: flex-end;
+        gap: 24px;
+        align-items: center;
+        margin-top: 20px;
     }
 
     .save {
@@ -468,57 +1100,16 @@
         margin-left: 6px;
     }
 
-    /* panels */
-    h3 {
-        font-size: 13px;
-        margin: 8px 0;
-        color: var(--text);
-    }
-
-    .muted {
-        color: var(--text-muted);
-        font-size: 13px;
-    }
-
-    .ahead, .arow {
-        display: grid;
-        grid-template-columns: 1fr auto auto;
-        gap: 10px;
-        font-size: 13px;
-        padding: 5px 0;
-    }
-
-    .ahead {
-        color: var(--text-muted);
-        font-size: 11px;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .rt {
-        text-align: right;
-    }
-
-    .hot {
-        color: var(--ok);
-        font-weight: 600;
-    }
-
-    .sumline {
-        display: flex;
-        justify-content: space-between;
-        font-size: 13px;
-        margin-top: 8px;
-    }
-
-    .adv {
-        color: var(--warn);
-    }
-
     .sidehead {
         display: flex;
         justify-content: space-between;
         align-items: center;
         margin-bottom: 10px;
+    }
+
+    .muted {
+        color: var(--text-muted);
+        font-size: 13px;
     }
 
     .refresh {
@@ -540,24 +1131,51 @@
         gap: 6px;
     }
 
-    .hrow-btn {
+    .hrow {
         position: relative;
-        width: 100%;
-        text-align: left;
+        display: flex;
+        gap: 6px;
         background: var(--bg-app);
         border: 1px solid var(--border);
         border-radius: var(--radius);
-        padding: 8px 10px;
-        cursor: pointer;
-        color: var(--text);
+        padding: 4px;
     }
 
-    li.active .hrow-btn {
+    li.active .hrow {
         border-color: var(--accent);
     }
 
-    li.cancelled .hrow-btn {
+    li.cancelled .hrow {
         opacity: .55;
+    }
+
+    .hmain {
+        flex: 1;
+        text-align: left;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        color: var(--text);
+        padding: 4px 6px;
+    }
+
+    .hmain:disabled {
+        cursor: default;
+    }
+
+    .viewbtn {
+        background: transparent;
+        border: 1px solid var(--border-hi);
+        color: var(--text-muted);
+        border-radius: 6px;
+        cursor: pointer;
+        width: 30px;
+        flex-shrink: 0;
+    }
+
+    .viewbtn:hover {
+        border-color: var(--accent-text);
+        color: var(--accent-text);
     }
 
     .hline1 {
@@ -589,5 +1207,87 @@
         background: var(--danger-soft);
         padding: 1px 5px;
         border-radius: 4px;
+    }
+
+    .derived {
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        margin-bottom: 10px;
+        overflow: hidden;
+    }
+
+    .dhead {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--border);
+        font-size: 13px;
+        font-weight: 600;
+    }
+
+    .dtot {
+        color: var(--ok);
+    }
+
+    .dlines {
+        padding: 4px 12px 8px;
+    }
+
+    .dline {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 10px;
+        padding: 4px 0;
+        font-size: 12px;
+        color: var(--text-muted);
+    }
+
+    .rt {
+        text-align: right;
+    }
+    /* ── optional inline settlement (matches the charges section) ── */
+    .settle-inline {
+        margin-top: 14px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--bg-elevated);
+        padding: 8px 14px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-width: 560px;
+        margin-left: auto;
+    }
+
+    .settle-row {
+        display: flex;
+        gap: 14px;
+        align-items: flex-end;
+    }
+
+    .settle-row .field {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .settle-row .field.amt {
+        max-width: 180px;
+    }
+
+    .settle-hint {
+        margin: 0;
+        font-size: 11px;
+        color: var(--text-muted);
+    }
+
+    .settle-note {
+        font-size: 12px;
+        color: #b9c6ff;
+        background: #1d2233;
+        border: 1px solid #34406b;
+        border-radius: var(--radius);
+        padding: 6px 10px;
     }
 </style>
